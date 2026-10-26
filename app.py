@@ -619,3 +619,135 @@ if v9_pdf is not None:
 
     except Exception as e:
         st.error(f"V9 error: {e}")
+
+# TUESDAY AI V10 - PDF and Chart Rule Matching
+
+st.header("🤖 Tuesday AI V10 - PDF + Chart Matching")
+st.caption("Experimental historical rule matching only.")
+
+v10_pdf = st.file_uploader(
+    "Upload EMA strategy PDF",
+    type=["pdf"],
+    key="v10_pdf"
+)
+
+v10_csv = st.file_uploader(
+    "Upload historical XAUUSD OHLC CSV",
+    type=["csv"],
+    key="v10_csv"
+)
+
+if v10_pdf is not None and v10_csv is not None:
+    import fitz
+
+    try:
+        v10_pdf.seek(0)
+
+        with fitz.open(
+            stream=v10_pdf.read(),
+            filetype="pdf"
+        ) as doc:
+            pdf_text = " ".join(
+                page.get_text() for page in doc
+            ).lower()
+
+        v10_csv.seek(0)
+        prices = pd.read_csv(v10_csv)
+        prices.columns = prices.columns.str.strip().str.lower()
+
+        required = ["open", "high", "low", "close"]
+
+        if not all(c in prices.columns for c in required):
+            st.error("CSV needs open, high, low, close columns.")
+
+        else:
+            for col in required:
+                prices[col] = pd.to_numeric(
+                    prices[col], errors="coerce"
+                )
+
+            prices = prices.dropna(subset=required).copy()
+
+            valid = (
+                (prices["high"] >= prices[
+                    ["open", "close", "low"]
+                ].max(axis=1))
+                &
+                (prices["low"] <= prices[
+                    ["open", "close", "high"]
+                ].min(axis=1))
+            )
+
+            if len(prices) < 220 or not valid.all():
+                st.warning("Need at least 220 valid OHLC candles.")
+
+            else:
+                prices["ema50"] = prices["close"].ewm(
+                    span=50, adjust=False
+                ).mean()
+
+                prices["ema200"] = prices["close"].ewm(
+                    span=200, adjust=False
+                ).mean()
+
+                last = prices.iloc[-1]
+                previous = prices.iloc[-2]
+
+                pdf_has_ema = (
+                    "ema" in pdf_text
+                    and "pullback" in pdf_text
+                )
+
+                bullish = (
+                    last["ema50"] > last["ema200"]
+                    and last["close"] > last["ema50"]
+                )
+
+                bearish = (
+                    last["ema50"] < last["ema200"]
+                    and last["close"] < last["ema50"]
+                )
+
+                buy_match = (
+                    pdf_has_ema
+                    and bullish
+                    and last["low"] <= last["ema50"]
+                    and last["close"] > last["open"]
+                )
+
+                sell_match = (
+                    pdf_has_ema
+                    and bearish
+                    and last["high"] >= last["ema50"]
+                    and last["close"] < last["open"]
+                )
+
+                st.subheader("📋 PDF Strategy Check")
+
+                st.write(
+                    "EMA Pullback keywords:",
+                    "Found" if pdf_has_ema else "Not found"
+                )
+
+                st.write(
+                    "Previous candle close:",
+                    round(float(previous["close"]), 2)
+                )
+
+                if buy_match:
+                    st.success("Historical BUY rule match")
+
+                elif sell_match:
+                    st.error("Historical SELL rule match")
+
+                else:
+                    st.warning("WAIT - No rule match")
+
+                st.info(
+                    "Uses predefined EMA rules when PDF "
+                    "keywords are found. Does not interpret "
+                    "all PDF instructions or validate trades."
+                )
+
+    except Exception as e:
+        st.error(f"V10 analysis error: {e}")
