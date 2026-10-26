@@ -257,6 +257,7 @@ st.caption("Historical CSV analysis only. Not live trading advice.")
 
 if chart_file is not None:
     try:
+        chart_file.seek(0)
         data = pd.read_csv(chart_file)
         data.columns = data.columns.str.strip().str.lower()
 
