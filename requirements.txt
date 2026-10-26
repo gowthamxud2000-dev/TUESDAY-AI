@@ -1,2 +1,5 @@
 streamlit
 pymupdf
+streamlit
+pymupdf
+pandas
