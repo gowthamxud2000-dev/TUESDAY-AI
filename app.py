@@ -440,5 +440,5 @@ if v7_files:
                 "accuracy, profitability or win rate."
             )
 
-            st.success("PDF comparison completed!")        st.error(f"Signal engine error: {e}")
+            st.success("PDF comparison completed!")        
 
