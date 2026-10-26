@@ -364,6 +364,7 @@ if chart_file is not None:
                 )
 
     except Exception as e:
+                st.error(f"Signal engine error: {e}")
 # TUESDAY AI V7 - PDF Strategy Comparison
 
 st.header("📚 Tuesday AI V7 - PDF Strategy Comparison")
