@@ -364,5 +364,80 @@ if chart_file is not None:
                 )
 
     except Exception as e:
-        st.error(f"Signal engine error: {e}")
+# TUESDAY AI V7 - PDF Strategy Comparison
+
+st.header("📚 Tuesday AI V7 - PDF Strategy Comparison")
+
+v7_files = st.file_uploader(
+    "Upload 2 or more trading strategy PDFs",
+    type=["pdf"],
+    accept_multiple_files=True,
+    key="v7_pdf_upload"
+)
+
+strategy_keywords = {
+    "EMA Trend Pullback": [
+        "ema", "moving average", "pullback"
+    ],
+    "Breakout and Retest": [
+        "breakout", "retest", "resistance", "support"
+    ],
+    "Liquidity Sweep and BOS": [
+        "liquidity", "sweep", "bos", "break of structure"
+    ]
+}
+
+if v7_files:
+    if len(v7_files) < 2:
+        st.warning("Upload at least 2 PDFs to compare.")
+    else:
+        import fitz
+
+        comparison = []
+
+        for pdf_file in v7_files:
+            try:
+                pdf_file.seek(0)
+                doc = fitz.open(
+                    stream=pdf_file.read(),
+                    filetype="pdf"
+                )
+
+                content = " ".join(
+                    page.get_text() for page in doc
+                ).lower()
+
+                doc.close()
+
+                result = {"PDF": pdf_file.name}
+
+                for strategy, keywords in strategy_keywords.items():
+                    matches = sum(
+                        1 for word in keywords
+                        if word in content
+                    )
+                    result[strategy] = matches
+
+                comparison.append(result)
+
+            except Exception as e:
+                st.error(
+                    f"Error reading {pdf_file.name}: {e}"
+                )
+
+        if comparison:
+            comparison_df = pd.DataFrame(comparison)
+
+            st.subheader("📊 Strategy Comparison")
+            st.dataframe(
+                comparison_df,
+                use_container_width=True
+            )
+
+            st.info(
+                "Scores count keyword matches, not strategy "
+                "accuracy, profitability or win rate."
+            )
+
+            st.success("PDF comparison completed!")        st.error(f"Signal engine error: {e}")
 
