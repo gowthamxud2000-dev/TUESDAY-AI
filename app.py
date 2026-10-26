@@ -130,3 +130,54 @@ if books:
 
         except Exception as e:
             st.error(f"Analysis error: {e}")
+
+# TUESDAY AI V4 - Strategy Rules Extractor
+import re
+
+st.header("🎯 PDF Entry, SL & TP Rules")
+
+if books:
+    for book in books:
+        st.subheader(f"Rules: {book.name}")
+
+        try:
+            doc = pymupdf.open(
+                stream=book.getvalue(),
+                filetype="pdf"
+            )
+            text = "\n".join(
+                page.get_text() for page in doc
+            )
+            doc.close()
+
+            patterns = {
+                "Entry": r"\bentry\b",
+                "Stop Loss": r"\bstop[\s-]?loss\b|\bSL\b",
+                "Take Profit": r"\btake[\s-]?profit\b|\bTP\b",
+                "Confirmation": r"\bconfirm(?:ation|ed)?\b",
+            }
+
+            lines = text.splitlines()
+
+            for label, pattern in patterns.items():
+                matches = [
+                    line.strip()
+                    for line in lines
+                    if re.search(pattern, line, re.I)
+                ]
+
+                st.markdown(f"### {label}")
+
+                if matches:
+                    for line in matches[:10]:
+                        st.write("• " + line)
+                else:
+                    st.info("No matching rules found.")
+
+            st.caption(
+                "Extracted text only. Rules are not "
+                "validated or converted into live signals."
+            )
+
+        except Exception as e:
+            st.error(f"PDF processing error: {e}")
