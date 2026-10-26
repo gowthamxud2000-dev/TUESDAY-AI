@@ -181,3 +181,73 @@ if books:
 
         except Exception as e:
             st.error(f"PDF processing error: {e}")
+
+# TUESDAY AI V5 - XAUUSD Historical Chart Analyzer
+import pandas as pd
+
+st.header("📈 XAUUSD Chart Analysis V5")
+st.caption("Historical OHLC data only - not live trading signals.")
+
+chart_file = st.file_uploader(
+    "Upload XAUUSD OHLC CSV",
+    type=["csv"],
+    key="v5_chart"
+)
+
+if chart_file is not None:
+    try:
+        df = pd.read_csv(chart_file)
+        df.columns = df.columns.str.strip().str.lower()
+
+        required = ["open", "high", "low", "close"]
+        missing = [c for c in required if c not in df.columns]
+
+        if missing:
+            st.error("Missing columns: " + ", ".join(missing))
+        else:
+            for c in required:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+            df = df.dropna(subset=required).copy()
+
+            if len(df) < 200:
+                st.warning("At least 200 candles required.")
+            elif (
+                (df["high"] < df[["open", "close", "low"]].max(axis=1)).any()
+                or (df["low"] > df[["open", "close", "high"]].min(axis=1)).any()
+            ):
+                st.error("Invalid OHLC candle values.")
+            else:
+                df["ema50"] = df["close"].ewm(
+                    span=50, adjust=False
+                ).mean()
+                df["ema200"] = df["close"].ewm(
+                    span=200, adjust=False
+                ).mean()
+
+                latest = df.iloc[-1]
+                price = float(latest["close"])
+                ema50 = float(latest["ema50"])
+                ema200 = float(latest["ema200"])
+
+                if price > ema50 > ema200:
+                    st.success("Trend: BULLISH")
+                elif price < ema50 < ema200:
+                    st.error("Trend: BEARISH")
+                else:
+                    st.warning("Trend: MIXED / WAIT")
+
+                st.metric("Last CSV Close", f"{price:.2f}")
+                st.metric("EMA 50", f"{ema50:.2f}")
+                st.metric("EMA 200", f"{ema200:.2f}")
+
+                st.line_chart(
+                    df[["close", "ema50", "ema200"]].tail(100)
+                )
+                st.info(
+                    "Trend classification only. No verified "
+                    "BUY/SELL entry, SL or TP generated."
+                )
+    except Exception as e:
+        st.error(f"Chart analysis error: {e}")
+  
