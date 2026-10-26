@@ -58,3 +58,31 @@ st.info(
 
 st.caption("Tuesday AI | Manual trading only | No automatic order execution")
 
+
+# TUESDAY AI V2 - PDF Reading Engine
+import pymupdf
+
+st.header("📚 PDF Strategy Reader")
+
+if books:
+    for book in books:
+        st.subheader(book.name)
+        try:
+            pdf = pymupdf.open(stream=book.getvalue(), filetype="pdf")
+            extracted_text = "\n".join(
+                page.get_text() for page in pdf
+            )
+            pdf.close()
+
+            if extracted_text.strip():
+                st.success("PDF text extracted successfully!")
+                st.text_area(
+                    "Extracted trading strategy content",
+                    extracted_text,
+                    height=300,
+                    key=book.name
+                )
+            else:
+                st.warning("No readable text found in this PDF.")
+        except Exception as e:
+            st.error(f"Could not read PDF: {e}")
