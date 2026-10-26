@@ -86,3 +86,47 @@ if books:
                 st.warning("No readable text found in this PDF.")
         except Exception as e:
             st.error(f"Could not read PDF: {e}")
+
+# TUESDAY AI V3 - Strategy Analyzer
+
+st.header("🧠 Trading Strategy Analyzer")
+
+if books:
+    for book in books:
+        st.subheader(f"Analysis: {book.name}")
+
+        try:
+            doc = pymupdf.open(
+                stream=book.getvalue(),
+                filetype="pdf"
+            )
+            content = "\n".join(
+                page.get_text() for page in doc
+            ).lower()
+            doc.close()
+
+            strategies = {
+                "EMA Trend Pullback": [
+                    "ema", "pullback"
+                ],
+                "Breakout and Retest": [
+                    "breakout", "retest"
+                ],
+                "Liquidity Sweep and BOS": [
+                    "liquidity", "bos"
+                ]
+            }
+
+            for name, keywords in strategies.items():
+                if all(word in content for word in keywords):
+                    st.success(f"✅ Found: {name}")
+                else:
+                    st.info(f"Not detected: {name}")
+
+            st.caption(
+                "Keyword matching only. "
+                "No strategy validation or live signals."
+            )
+
+        except Exception as e:
+            st.error(f"Analysis error: {e}")
