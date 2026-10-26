@@ -442,3 +442,85 @@ if v7_files:
 
             st.success("PDF comparison completed!")        
 
+# TUESDAY AI V8 - PDF Trading Rule Extractor
+
+st.header("🧠 Tuesday AI V8 - PDF Rule Extractor")
+st.caption("Extracts possible trading rules from PDF text.")
+
+v8_pdf = st.file_uploader(
+    "Upload a trading strategy PDF",
+    type=["pdf"],
+    key="v8_pdf_upload"
+)
+
+if v8_pdf is not None:
+    import fitz
+    import re
+
+    try:
+        v8_pdf.seek(0)
+
+        with fitz.open(
+            stream=v8_pdf.read(),
+            filetype="pdf"
+        ) as doc:
+            pdf_text = "\n".join(
+                page.get_text() for page in doc
+            )
+
+        categories = {
+            "Entry Rules": [
+                "entry", "enter", "buy", "sell"
+            ],
+            "Stop Loss Rules": [
+                "stop loss", "stop-loss", "sl"
+            ],
+            "Take Profit Rules": [
+                "take profit", "take-profit", "target"
+            ],
+            "Confirmation Rules": [
+                "confirmation", "confirm", "candle close"
+            ]
+        }
+
+        lines = [
+            re.sub(r"\s+", " ", line).strip()
+            for line in pdf_text.splitlines()
+        ]
+
+        lines = [
+            line for line in lines
+            if len(line) >= 8
+        ]
+
+        for category, keywords in categories.items():
+            st.subheader(category)
+
+            matches = [
+                line for line in lines
+                if any(
+                    re.search(
+                        r"\b" + re.escape(word) + r"\b",
+                        line,
+                        flags=re.IGNORECASE
+                    )
+                    for word in keywords
+                )
+            ]
+
+            if matches:
+                for line in dict.fromkeys(matches[:15]):
+                    st.write("• " + line)
+            else:
+                st.info("No matching rules found.")
+
+        st.success("PDF rule extraction completed!")
+
+        st.caption(
+            "These are keyword-matched PDF lines, "
+            "not verified trading instructions. "
+            "Scanned PDFs may require OCR."
+        )
+
+    except Exception as e:
+        st.error(f"V8 PDF extraction error: {e}")
