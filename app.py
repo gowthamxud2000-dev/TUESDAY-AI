@@ -524,3 +524,98 @@ if v8_pdf is not None:
 
     except Exception as e:
         st.error(f"V8 PDF extraction error: {e}")
+
+# TUESDAY AI V9 - Strategy Rule Checklist
+
+st.header("🧠 Tuesday AI V9 - Strategy Rule Checklist")
+st.caption("Checks whether key trading rules appear in PDF text.")
+
+v9_pdf = st.file_uploader(
+    "Upload a trading strategy PDF for V9",
+    type=["pdf"],
+    key="v9_pdf_upload"
+)
+
+if v9_pdf is not None:
+    import fitz
+    import re
+
+    try:
+        v9_pdf.seek(0)
+
+        with fitz.open(
+            stream=v9_pdf.read(),
+            filetype="pdf"
+        ) as doc:
+            pdf_text = "\n".join(
+                page.get_text() for page in doc
+            )
+
+        text_lower = re.sub(
+            r"\s+", " ", pdf_text.lower()
+        )
+
+        rule_categories = {
+            "Entry": [
+                r"\bentry\b", r"\benter\b",
+                r"\bbuy\b", r"\bsell\b"
+            ],
+            "Stop Loss": [
+                r"\bstop[\s-]*loss\b",
+                r"\bstop\b", r"\bsl\b"
+            ],
+            "Take Profit": [
+                r"\btake[\s-]*profit\b",
+                r"\btarget\b", r"\btp\b",
+                r"\brisk[\s/-]*reward\b"
+            ],
+            "Confirmation": [
+                r"\bconfirm\w*\b",
+                r"\bcandle[\s-]*close\b",
+                r"\bretest\b"
+            ]
+        }
+
+        results = []
+
+        for category, patterns in rule_categories.items():
+            found = any(
+                re.search(pattern, text_lower)
+                for pattern in patterns
+            )
+
+            results.append({
+                "Rule": category,
+                "Status": "Mentioned" if found else "Not found"
+            })
+
+        st.subheader("📋 PDF Rule Checklist")
+        st.dataframe(
+            pd.DataFrame(results),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        missing = [
+            item["Rule"]
+            for item in results
+            if item["Status"] == "Not found"
+        ]
+
+        if missing:
+            st.warning(
+                "No matching keywords found for: "
+                + ", ".join(missing)
+            )
+        else:
+            st.success(
+                "All four rule categories have keyword matches!"
+            )
+
+        st.info(
+            "Mentioned does not mean the rule is complete, "
+            "correct, or suitable for trading."
+        )
+
+    except Exception as e:
+        st.error(f"V9 error: {e}")
