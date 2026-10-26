@@ -251,3 +251,117 @@ if chart_file is not None:
     except Exception as e:
         st.error(f"Chart analysis error: {e}")
   
+# TUESDAY AI V6 - Experimental Signal Engine
+st.header("🤖 XAUUSD Signal Engine V6")
+st.caption("Historical CSV analysis only. Not live trading advice.")
+
+if chart_file is not None:
+    try:
+        data = pd.read_csv(chart_file)
+        data.columns = data.columns.str.strip().str.lower()
+
+        required = ["open", "high", "low", "close"]
+
+        if not all(c in data.columns for c in required):
+            st.error("CSV must contain open, high, low, close.")
+        else:
+            for c in required:
+                data[c] = pd.to_numeric(data[c], errors="coerce")
+
+            data = data.dropna(subset=required).copy()
+
+            valid = (
+                (data["high"] >= data[["open", "close", "low"]].max(axis=1))
+                & (data["low"] <= data[["open", "close", "high"]].min(axis=1))
+            )
+
+            if len(data) < 220 or not valid.all():
+                st.warning("Need 220 valid OHLC candles.")
+            else:
+                data["ema50"] = data["close"].ewm(
+                    span=50, adjust=False
+                ).mean()
+                data["ema200"] = data["close"].ewm(
+                    span=200, adjust=False
+                ).mean()
+
+                # Use previous 20 completed candles for levels
+                previous = data.iloc[-21:-1]
+                candle = data.iloc[-1]
+
+                resistance = previous["high"].max()
+                support = previous["low"].min()
+
+                close = float(candle["close"])
+                high = float(candle["high"])
+                low = float(candle["low"])
+                ema50 = float(candle["ema50"])
+                ema200 = float(candle["ema200"])
+
+                bullish = close > ema50 > ema200
+                bearish = close < ema50 < ema200
+
+                buy_breakout = bullish and close > resistance
+                sell_breakdown = bearish and close < support
+
+                # Pullback must touch EMA50 and close back
+                buy_pullback = (
+                    bullish and low <= ema50 and close > ema50
+                )
+                sell_pullback = (
+                    bearish and high >= ema50 and close < ema50
+                )
+
+                signal = "WAIT"
+                setup = "No confirmed setup"
+                entry = close
+                stop = None
+                target = None
+
+                if buy_breakout or buy_pullback:
+                    signal = "BUY"
+                    setup = (
+                        "Breakout" if buy_breakout else "EMA Pullback"
+                    )
+                    stop = min(low, float(previous["low"].tail(5).min()))
+                    risk = entry - stop
+                    if risk > 0:
+                        target = entry + 2 * risk
+                    else:
+                        signal = "WAIT"
+
+                elif sell_breakdown or sell_pullback:
+                    signal = "SELL"
+                    setup = (
+                        "Breakdown" if sell_breakdown else "EMA Pullback"
+                    )
+                    stop = max(high, float(previous["high"].tail(5).max()))
+                    risk = stop - entry
+                    if risk > 0:
+                        target = entry - 2 * risk
+                    else:
+                        signal = "WAIT"
+
+                st.subheader(f"Historical Signal: {signal}")
+                st.write(f"Setup: {setup}")
+
+                if signal != "WAIT" and target is not None:
+                    st.metric("Example Entry", f"{entry:.2f}")
+                    st.metric("Example SL", f"{stop:.2f}")
+                    st.metric("Example TP (2R)", f"{target:.2f}")
+                    st.info(
+                        "Experimental setup only. No spread, "
+                        "slippage, volatility or news filters."
+                    )
+                else:
+                    st.warning("WAIT - No qualifying setup.")
+
+                st.caption(
+                    "This engine uses hard-coded EMA and price "
+                    "rules, not the uploaded PDF strategies. "
+                    "Backtesting is required."
+                )
+
+    except Exception as e:
+        st.error(f"Signal engine error: {e}")
+
