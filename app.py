@@ -1,197 +1,82 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 
-st.set_page_config(
-    page_title="Tuesday AI V14",
-    page_icon="🥇",
-    layout="wide"
-)
+st.set_page_config(page_title='Tuesday AI V15', page_icon='🥇', layout='wide')
+st.title('🥇 Tuesday AI V15 — Backtest Audit')
+st.caption('XAUUSD | Research dashboard — not live trade signals')
 
-st.title("🥇 Tuesday AI V14")
-st.subheader("XAUUSD Gold Backtest Analyzer")
+uploaded = st.file_uploader('Upload Tuesday AI V14 audit CSV', type=['csv'])
+if uploaded is None:
+    st.info('Upload Tuesday_AI_V14_audit.csv to begin.')
+    st.stop()
 
-st.warning("Research only. No guaranteed live profits.")
+try:
+    df = pd.read_csv(uploaded)
+except Exception as e:
+    st.error(f'Could not read CSV: {e}')
+    st.stop()
 
-st.sidebar.header("Trading Costs")
+required = {'Outcome', 'Setup', 'Side', 'R', 'Net_R'}
+missing = required - set(df.columns)
+if missing:
+    st.error('Missing columns: ' + ', '.join(sorted(missing)))
+    st.stop()
 
-spread = st.sidebar.number_input(
-    "Round-trip spread (price units)",
-    min_value=0.0,
-    value=0.30,
-    step=0.05
-)
+for c in ['R', 'Net_R', 'Risk', 'Cost_R']:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+for c in ['Signal time', 'Entry time', 'Exit time']:
+    if c in df.columns:
+        df[c] = pd.to_datetime(df[c], errors='coerce')
 
-slippage = st.sidebar.number_input(
-    "Round-trip slippage (price units)",
-    min_value=0.0,
-    value=0.20,
-    step=0.05
-)
+outcomes = df['Outcome'].fillna('MISSING').astype(str).str.upper().str.strip()
+resolved_flag = df['Resolved'].astype(str).str.lower().eq('true') if 'Resolved' in df else outcomes.isin(['WIN', 'LOSS'])
+valid_flag = df['ValidRisk'].astype(str).str.lower().eq('true') if 'ValidRisk' in df else pd.Series(True, index=df.index)
+valid = resolved_flag & valid_flag & outcomes.isin(['WIN', 'LOSS']) & df['Net_R'].notna()
+trades = df.loc[valid].copy()
+wins = (outcomes.loc[valid] == 'WIN').sum()
+losses = (outcomes.loc[valid] == 'LOSS').sum()
 
-commission = st.sidebar.number_input(
-    "Commission per trade (R)",
-    min_value=0.0,
-    value=0.0,
-    step=0.01
-)
+st.subheader('📊 Verified outcomes')
+a, b, c, d = st.columns(4)
+a.metric('All signals', len(df))
+b.metric('Resolved valid trades', len(trades))
+c.metric('Win rate', f'{wins / len(trades) * 100:.1f}%' if len(trades) else 'N/A')
+d.metric('Net R (resolved)', f'{trades.Net_R.sum():+.2f}R' if len(trades) else 'N/A')
+st.caption(f'Wins: {wins} | Losses: {losses} | Excluded/unresolved: {len(df) - len(trades)}')
 
-file = st.file_uploader(
-    "Upload V13 Trades CSV",
-    type=["csv"]
-)
+st.subheader('🔎 Excluded / unresolved signals')
+excluded = df.loc[~valid].copy()
+st.write(excluded['Outcome'].fillna('MISSING').value_counts().rename_axis('Outcome').reset_index(name='Count'))
+if len(excluded):
+    st.dataframe(excluded, use_container_width=True)
+    st.download_button('Download excluded signals', excluded.to_csv(index=False).encode(), 'Tuesday_AI_V15_excluded.csv', 'text/csv')
 
-if file is not None:
+st.subheader('📈 Performance by setup')
+if len(trades):
+    summary = trades.groupby('Setup', dropna=False).agg(Trades=('Net_R', 'size'), Net_R=('Net_R', 'sum'), Avg_R=('Net_R', 'mean'))
+    summary['Win_rate_%'] = trades.assign(IsWin=outcomes.loc[valid].eq('WIN').astype(int)).groupby('Setup', dropna=False)['IsWin'].mean() * 100
+    st.dataframe(summary.round(2), use_container_width=True)
+    st.bar_chart(summary['Net_R'])
 
-    try:
-        df = pd.read_csv(file)
-    except Exception as e:
-        st.error(f"CSV error: {e}")
-        st.stop()
-
-    required = [
-        "Setup", "Side", "Entry",
-        "SL", "Outcome", "R"
-    ]
-
-    missing = [c for c in required if c not in df.columns]
-
-    if missing:
-        st.error(f"Missing columns: {missing}")
-        st.stop()
-
-    for col in ["Entry", "SL", "R"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df["Outcome"] = (
-        df["Outcome"].astype(str).str.strip().str.upper()
-    )
-
-    df["Risk"] = abs(df["Entry"] - df["SL"])
-
-    df["Resolved"] = df["Outcome"].isin(
-        ["WIN", "LOSS"]
-    )
-
-    df["ValidRisk"] = (
-        df["Risk"].gt(0) &
-        np.isfinite(df["Risk"])
-    )
-
-    df["Cost_R"] = np.where(
-        df["ValidRisk"],
-        (spread + slippage) / df["Risk"] + commission,
-        np.nan
-    )
-
-    df["Net_R"] = np.where(
-        df["Resolved"] & df["ValidRisk"],
-        df["R"] - df["Cost_R"],
-        np.nan
-    )
-
-    valid = df[
-        df["Resolved"] &
-        df["ValidRisk"] &
-        df["R"].notna()
-    ].copy()
-
-    wins = (valid["Outcome"] == "WIN").sum()
-    losses = (valid["Outcome"] == "LOSS").sum()
-    total = len(valid)
-
-    winrate = 100 * wins / total if total else 0
-    net_r = valid["Net_R"].sum()
-
-    st.header("📊 V14 Performance")
-
-    a, b, c, d = st.columns(4)
-
-    a.metric("Total Trades", len(df))
-    b.metric("Wins", int(wins))
-    c.metric("Losses", int(losses))
-    d.metric("Win Rate", f"{winrate:.1f}%")
-
-    st.metric(
-        "Net Result After Costs",
-        f"{net_r:+.2f}R"
-    )
-
-    unresolved = len(df) - total
-
-    st.info(
-        f"Unresolved or invalid trades: {unresolved}"
-    )
-
-    st.header("📋 Outcome Audit")
-
-    st.dataframe(
-        df["Outcome"].value_counts().reset_index(),
-        use_container_width=True
-    )
-
-    if total:
-
-        st.header("🎯 Setup Performance")
-
-        setup = valid.groupby("Setup").agg(
-            Trades=("R", "size"),
-            Gross_R=("R", "sum"),
-            Net_R=("Net_R", "sum"),
-            Average_R=("Net_R", "mean")
-        )
-
-        st.dataframe(
-            setup,
-            use_container_width=True
-        )
-
-        st.header("📈 BUY vs SELL")
-
-        side = valid.groupby("Side").agg(
-            Trades=("R", "size"),
-            Net_R=("Net_R", "sum")
-        )
-
-        st.dataframe(
-            side,
-            use_container_width=True
-        )
-
-        st.header("📉 Equity Curve")
-
-        valid["Cumulative_R"] = (
-            valid["Net_R"].cumsum()
-        )
-
-        st.line_chart(
-            valid["Cumulative_R"].reset_index(drop=True)
-        )
-
-        peak = (
-            valid["Cumulative_R"]
-            .cummax()
-            .clip(lower=0)
-        )
-
-        drawdown = valid["Cumulative_R"] - peak
-
-        st.metric(
-            "Maximum Drawdown",
-            f"{drawdown.min():.2f}R"
-        )
-
-    st.header("📥 Download Results")
-
-    st.download_button(
-        "Download V14 Audit CSV",
-        data=df.to_csv(index=False),
-        file_name="Tuesday_AI_V14_audit.csv",
-        mime="text/csv"
-    )
-
-    st.success("Tuesday AI V14 analysis complete!")
-
+    st.subheader('📉 Equity curve & drawdown (in R)')
+    order_col = 'Exit time' if 'Exit time' in trades.columns else ('Entry time' if 'Entry time' in trades.columns else None)
+    if order_col:
+        trades = trades.sort_values(order_col, kind='stable', na_position='last')
+    trades['Cumulative_R'] = trades['Net_R'].cumsum()
+    trades['Peak_R'] = trades['Cumulative_R'].cummax().clip(lower=0)
+    trades['Drawdown_R'] = trades['Cumulative_R'] - trades['Peak_R']
+    st.line_chart(trades[['Cumulative_R']].reset_index(drop=True))
+    st.metric('Maximum drawdown', f'{trades.Drawdown_R.min():.2f}R')
+    st.metric('Average net R / trade', f'{trades.Net_R.mean():+.3f}R')
+    gross_profit = trades.loc[trades.Net_R > 0, 'Net_R'].sum()
+    gross_loss = -trades.loc[trades.Net_R < 0, 'Net_R'].sum()
+    st.metric('Profit factor', f'{gross_profit / gross_loss:.2f}' if gross_loss else 'N/A')
+    st.subheader('📋 Audited resolved trades')
+    st.dataframe(trades, use_container_width=True)
+    st.download_button('Download V15 audited trades', trades.to_csv(index=False).encode(), 'Tuesday_AI_V15_audited.csv', 'text/csv')
 else:
-    st.info("Upload V13 trades CSV to begin.")
+    st.warning('No valid resolved trades found. Check Outcome, Resolved, ValidRisk and Net_R columns.')
+
+st.warning('Backtests can overstate results. DATA_GAP and ambiguous outcomes are excluded, not assumed to be wins. Confirm data quality, spread, slippage and out-of-sample results before risking real money.')
