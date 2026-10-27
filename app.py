@@ -2,75 +2,109 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-st.set_page_config(page_title='Tuesday AI V21', page_icon='🥇', layout='wide')
-st.title('🥇 Tuesday AI V21 — Backtest Risk Lab')
-st.caption('Trade-ledger analysis only. Not a live signal engine or independent price-data backtest.')
-file = st.file_uploader('Upload V20 audited trades CSV', type=['csv'])
+st.set_page_config(page_title='Tuesday AI V22', page_icon='🥇', layout='wide')
+st.title('🥇 Tuesday AI V22 — Risk-Control Stress Lab')
+st.caption('Research simulator only. No live orders. V21 trade outcomes are historical and do not prove future performance.')
+file = st.file_uploader('Upload V21 stress trades CSV', type=['csv'])
+with st.sidebar:
+    st.header('Simulation settings')
+    starting = st.number_input('Starting balance ($)', min_value=100.0, value=1000.0, step=100.0)
+    risk = st.slider('Risk per trade (%)', 0.25, 2.0, 1.0, 0.25)
+    daily_limit = st.slider('Daily loss limit (%)', 1.0, 10.0, 3.0, 0.5)
+    max_dd = st.slider('Maximum drawdown stop (%)', 3.0, 30.0, 15.0, 1.0)
+    extra_cost_r = st.number_input('Extra execution cost (R per trade)', 0.0, 1.0, 0.05, 0.01, help='Added spread/slippage/commission stress beyond V21 costs, in units of initial stop risk. Not broker-verified.')
+    loss_streak_limit = st.slider('Pause after consecutive losses', 2, 10, 4)
+
 if file is None:
-    st.info('Upload Tuesday_AI_V20_audited_trades.csv to begin.')
+    st.info('Upload Tuesday_AI_V21_stress_trades.csv to run the V22 simulation.')
     st.stop()
 try:
     df = pd.read_csv(file)
-except Exception as e:
-    st.error(f'Cannot read CSV: {e}')
+except Exception as exc:
+    st.error(f'Could not read CSV: {exc}')
     st.stop()
-required = {'entry_time', 'net_usd', 'gross_usd'}
+required = {'entry_time', 'exit_time', 'side', 'entry', 'sl', 'exit', 'net_r'}
 missing = required - set(df.columns)
 if missing:
-    st.error('Missing columns: ' + ', '.join(sorted(missing)))
+    st.error('Missing required columns: ' + ', '.join(sorted(missing)))
     st.stop()
-df['entry_time'] = pd.to_datetime(df['entry_time'], errors='coerce')
-for col in ['net_usd', 'gross_usd']:
-    df[col] = pd.to_numeric(df[col], errors='coerce')
-df = df.dropna(subset=['entry_time', 'net_usd', 'gross_usd']).sort_values('entry_time').reset_index(drop=True)
 if df.empty:
-    st.error('No valid trades found.')
+    st.error('CSV contains no trades.')
     st.stop()
-st.sidebar.header('Risk assumptions')
-starting_equity = st.sidebar.number_input('Starting equity (USD)', min_value=1.0, value=1000.0, step=100.0)
-extra_slippage = st.sidebar.number_input('Extra round-trip slippage (XAUUSD price units)', min_value=0.0, value=0.0, step=0.1)
-extra_commission = st.sidebar.number_input('Extra commission per trade (USD)', min_value=0.0, value=0.0, step=0.5)
-extra_spread = st.sidebar.number_input('Extra round-trip spread cost (XAUUSD price units)', min_value=0.0, value=0.0, step=0.1)
-st.sidebar.caption('Extra costs are ADDED to costs already reflected in V20 net_usd. No double-counting the V20 baseline.')
-# Infer dollars per XAUUSD price unit from ledger, if present; otherwise require manual setting.
-if {'net_price', 'net_usd'}.issubset(df.columns):
-    price = pd.to_numeric(df['net_price'], errors='coerce')
-    ratio = (df['net_usd'] / price.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).dropna()
-    inferred = float(ratio.median()) if len(ratio) else 1.0
-else:
-    inferred = 1.0
-usd_per_price_unit = st.sidebar.number_input('USD per 1.0 XAUUSD price unit (per trade)', min_value=0.0001, value=max(0.0001, round(inferred, 4)), step=0.1, format='%.4f')
-extra_cost = (extra_slippage + extra_spread) * usd_per_price_unit + extra_commission
-df['stress_net_usd'] = df['net_usd'] - extra_cost
-df['equity'] = starting_equity + df['stress_net_usd'].cumsum()
-peak = pd.concat([pd.Series([starting_equity]), df['equity']], ignore_index=True).cummax().iloc[1:].reset_index(drop=True)
-df['drawdown_usd'] = df['equity'] - peak
-df['drawdown_pct'] = 100 * df['drawdown_usd'] / peak
-wins = df.loc[df['stress_net_usd'] > 0, 'stress_net_usd'].sum()
-losses = -df.loc[df['stress_net_usd'] < 0, 'stress_net_usd'].sum()
-pf = wins / losses if losses > 0 else float('inf') if wins > 0 else 0.0
-cols = st.columns(4)
-cols[0].metric('Trades', len(df))
-cols[1].metric('Stressed net P&L', f"${df['stress_net_usd'].sum():,.2f}")
-cols[2].metric('Win rate', f"{(df['stress_net_usd'] > 0).mean():.1%}")
-cols[3].metric('Profit factor', f'{pf:.2f}')
-a, b = st.columns(2)
-a.metric('Max drawdown (USD)', f"${df['drawdown_usd'].min():,.2f}")
-b.metric('Max drawdown (%)', f"{df['drawdown_pct'].min():.2f}%")
+for c in ['entry', 'sl', 'exit', 'net_r']:
+    df[c] = pd.to_numeric(df[c], errors='coerce')
+for c in ['entry_time', 'exit_time']:
+    df[c] = pd.to_datetime(df[c], errors='coerce')
+invalid = df[list(required - {'side'})].isna().any(axis=1) | ((df['entry'] - df['sl']).abs() <= 0)
+if invalid.any():
+    st.warning(f'{invalid.sum()} invalid rows excluded.')
+    df = df.loc[~invalid].copy()
+if df.empty:
+    st.stop()
+df = df.sort_values(['entry_time', 'exit_time']).reset_index(drop=True)
+if (df['exit_time'] < df['entry_time']).any():
+    st.error('Exit earlier than entry detected. Fix the source CSV.')
+    st.stop()
+# Conservative sequential simulation: never overlap positions, no look-ahead on open trades.
+balance = starting
+peak = starting
+day = None
+day_start = starting
+daily_block = False
+streak = 0
+halted = False
+last_exit = pd.Timestamp.min
+records = []
+for _, trade in df.iterrows():
+    entry_t = trade['entry_time']
+    if entry_t.date() != day:
+        day = entry_t.date()
+        day_start = balance
+        daily_block = False
+        streak = 0
+    reason = ''
+    if halted:
+        reason = 'Max drawdown halt'
+    elif entry_t < last_exit:
+        reason = 'Overlapping trade skipped'
+    elif daily_block:
+        reason = 'Daily loss lock'
+    elif streak >= loss_streak_limit:
+        reason = 'Loss streak lock'
+    if reason:
+        records.append({'entry_time': entry_t, 'side': trade['side'], 'status': reason, 'net_r': np.nan, 'pnl_usd': 0.0, 'equity': balance, 'drawdown_pct': (peak-balance)/peak*100})
+        continue
+    # net_r from V21 includes its original simulated costs; subtract incremental stress cost.
+    realized_r = float(trade['net_r']) - extra_cost_r
+    position_risk = balance * risk / 100
+    pnl = position_risk * realized_r
+    balance += pnl
+    peak = max(peak, balance)
+    dd = (peak-balance)/peak*100
+    last_exit = trade['exit_time']
+    streak = streak+1 if pnl < 0 else 0
+    if balance <= day_start * (1-daily_limit/100):
+        daily_block = True
+    if dd >= max_dd or balance <= 0:
+        halted = True
+    records.append({'entry_time': entry_t, 'side': trade['side'], 'status': 'Executed', 'net_r': realized_r, 'pnl_usd': pnl, 'equity': balance, 'drawdown_pct': dd})
+result = pd.DataFrame(records)
+executed = result[result['status']=='Executed']
+wins = int((executed['pnl_usd']>0).sum())
+losses = int((executed['pnl_usd']<0).sum())
+max_observed_dd = result['drawdown_pct'].max()
+profit = balance - starting
+c1,c2,c3,c4 = st.columns(4)
+c1.metric('Final balance', f'${balance:,.2f}')
+c2.metric('Net P&L', f'${profit:+,.2f}')
+c3.metric('Win rate', f'{wins/len(executed)*100:.1f}%' if len(executed) else 'N/A')
+c4.metric('Max drawdown', f'{max_observed_dd:.2f}%')
+st.write(f'Executed: **{len(executed)}** | Skipped: **{len(result)-len(executed)}** | Losses: **{losses}**')
+if halted:
+    st.warning('Maximum drawdown threshold was reached: later trades were halted. A loss may overshoot the limit.')
 st.subheader('Equity curve')
-st.line_chart(df.set_index('entry_time')['equity'])
-st.subheader('Chronological holdout (descriptive, not an independent validation)')
-st.caption('The last 30% is held out chronologically for reporting. Because this is an already-generated trade ledger, it does NOT prove the strategy was developed without seeing holdout data. True out-of-sample validation requires freezing rules and rerunning on unseen price candles.')
-split = max(1, min(len(df) - 1, int(len(df) * 0.7))) if len(df) > 1 else len(df)
-rows = []
-for label, subset in [('First 70%', df.iloc[:split]), ('Last 30%', df.iloc[split:])]:
-    rows.append({'Period': label, 'Trades': len(subset), 'Net USD': round(subset['stress_net_usd'].sum(), 2), 'Win rate %': round(100 * (subset['stress_net_usd'] > 0).mean(), 2) if len(subset) else None})
-st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-st.subheader('Cost sensitivity')
-sensitivity = []
-for add in [0, 0.5, 1, 2, 3, 5]:
-    pnl = df['net_usd'] - extra_cost - add
-    sensitivity.append({'Additional USD / trade': add, 'Net P&L USD': round(pnl.sum(), 2), 'Win rate %': round(100 * (pnl > 0).mean(), 2)})
-st.dataframe(pd.DataFrame(sensitivity), hide_index=True, use_container_width=True)
-st.download_button('Download V21 stress-tested trades CSV', df.to_csv(index=False).encode(), 'Tuesday_AI_V21_stress_trades.csv', 'text/csv')
-st.warning('Backtests can overstate performance: candle ordering, intrabar TP/SL sequencing, data quality, execution, and unseen-market testing are not independently verified here. Do not treat these results as a live trading recommendation.')
+st.line_chart(pd.concat([pd.Series([starting]),result['equity']], ignore_index=True))
+st.subheader('Trade audit')
+st.dataframe(result, use_container_width=True)
+st.download_button('Download V22 audited trades CSV', result.to_csv(index=False).encode(), 'Tuesday_AI_V22_audited_trades.csv', 'text/csv')
+st.info('Limitations: V21 net_r already contains modeled costs. The extra cost is an additional R-based stress assumption, not independent bid/ask fill simulation. Intrabar stop/target ordering, gaps, variable spread, partial fills, broker lot rules and actual order latency are not verified. Day boundaries follow the CSV timestamps. Daily and drawdown locks act after a trade closes; they cannot cap a single trade loss.')
