@@ -1,165 +1,64 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-from io import BytesIO
-
-st.set_page_config(page_title='Tuesday AI V26 Fibonacci', page_icon='🥇', layout='wide')
-st.title('🥇 Tuesday AI V26 — Fibonacci Backtest')
-st.caption('Research only • XAUUSD M15 • No live execution • Confirmed pivots only')
-
-with st.sidebar:
-    capital = st.number_input('Starting balance ($)', min_value=100.0, value=1000.0, step=100.0)
-    risk_pct = st.slider('Risk per trade (%)', 0.1, 1.0, 0.5, 0.1)
-    spread = st.number_input('Spread in gold price units ($/oz)', min_value=0.0, value=0.30, step=0.05)
-    slippage = st.number_input('Slippage per side ($/oz)', min_value=0.0, value=0.10, step=0.05)
-    commission = st.number_input('Commission round-trip ($ per oz)', min_value=0.0, value=0.10, step=0.05)
-    pivot = st.slider('Pivot confirmation bars', 2, 12, 5)
-    min_stop = st.number_input('Minimum stop distance ($/oz)', min_value=0.1, value=1.0)
-    st.caption('Costs are assumptions. Set to your broker’s actual contract and execution terms.')
-
-uploaded = st.file_uploader('Upload historical XAUUSD OHLC M1/M15 CSV or tab-separated TXT', type=['csv','txt'])
-st.info('V25 trades CSV alone cannot reconstruct a Fibonacci strategy. Upload original OHLC candles (e.g. DAT_ASCII_XAUUSD_M1_202608.csv).')
-
-def load_candles(file):
-    raw = file.getvalue()
-    frame = None
-    for sep in [None, '\t', ',', ';']:
-        try:
-            temp = pd.read_csv(BytesIO(raw), sep=sep, engine='python')
-            if temp.shape[1] >= 5:
-                frame = temp
-                break
-        except Exception:
-            pass
-    if frame is None:
-        raise ValueError('Could not parse OHLC data')
-    frame.columns = [str(c).strip().lower().replace('<','').replace('>','') for c in frame.columns]
-    aliases = {'open':'open','high':'high','low':'low','close':'close', 'date':'date','time':'time','datetime':'datetime','timestamp':'datetime'}
-    frame = frame.rename(columns={c: aliases.get(c,c) for c in frame.columns})
-    if 'datetime' in frame:
-        dates = pd.to_datetime(frame['datetime'], errors='coerce')
-    elif 'date' in frame and 'time' in frame:
-        dates = pd.to_datetime(frame['date'].astype(str)+' '+frame['time'].astype(str), errors='coerce')
-    elif 'date' in frame:
-        dates = pd.to_datetime(frame['date'], errors='coerce')
-    else:
-        raise ValueError('Need datetime or date/time columns')
-    frame.index = dates
-    frame = frame.loc[~frame.index.isna()]
-    for col in ['open','high','low','close']:
-        if col not in frame: raise ValueError('Missing '+col+' column')
-        frame[col] = pd.to_numeric(frame[col], errors='coerce')
-    frame = frame[['open','high','low','close']].dropna().sort_index()
-    frame = frame[~frame.index.duplicated(keep='last')]
-    if frame.empty: raise ValueError('No valid rows')
-    # 15-minute OHLC bars; right label means all bar inputs are available at that timestamp
-    frame = frame.resample('15min', label='right', closed='left').agg({'open':'first','high':'max','low':'min','close':'last'}).dropna()
-    frame = frame[(frame.high >= frame[['open','close','low']].max(axis=1)) & (frame.low <= frame[['open','close','high']].min(axis=1))]
-    return frame
-
-def run_strategy(df, zone_low, zone_high):
-    d = df.copy()
-    d['ema50'] = d.close.ewm(span=50, adjust=False, min_periods=50).mean()
-    d['ema200'] = d.close.ewm(span=200, adjust=False, min_periods=200).mean()
-    # A pivot at bar j is not known until bar j+pivot has CLOSED.
-    confirmed = []
-    trades = []
-    equity = capital
-    peak = capital
-    position = None
-    pending = None
-    for i in range(len(d)):
-        row = d.iloc[i]
-        if i >= 2*pivot:
-            j = i-pivot
-            window = d.iloc[j-pivot:j+pivot+1]
-            if d.high.iloc[j] == window.high.max() and (window.high == d.high.iloc[j]).sum() == 1:
-                confirmed.append(('H', float(d.high.iloc[j]), j))
-            if d.low.iloc[j] == window.low.min() and (window.low == d.low.iloc[j]).sum() == 1:
-                confirmed.append(('L', float(d.low.iloc[j]), j))
-        if position is not None:
-            # Conservative same-bar handling: SL first if SL and TP both touched.
-            hit_stop = row.low <= position['stop'] if position['side']=='BUY' else row.high >= position['stop']
-            hit_target = row.high >= position['target'] if position['side']=='BUY' else row.low <= position['target']
-            if hit_stop or hit_target:
-                intended = position['stop'] if hit_stop else position['target']
-                # Gaps can worsen stops; no favorable fill beyond target assumed.
-                if hit_stop:
-                    intended = min(intended, row.open) if position['side']=='BUY' else max(intended, row.open)
-                exit_fill = intended - (spread/2+slippage) if position['side']=='BUY' else intended+(spread/2+slippage)
-                pnl = ((exit_fill-position['entry']) if position['side']=='BUY' else (position['entry']-exit_fill))*position['qty'] - commission*position['qty']
-                equity += pnl
-                peak = max(peak, equity)
-                trades.append({**position, 'exit_time':d.index[i], 'exit':exit_fill, 'net_pnl':pnl,'equity':equity,'drawdown_pct':(peak-equity)/peak*100,'reason':'Stop' if hit_stop else 'Target'})
-                position = None
-        # Signal from completed bar i-1, entry on NEXT bar open i.
-        if pending is not None and position is None and equity > 0:
-            side, stop, target = pending
-            entry = float(row.open) + (spread/2+slippage)*(1 if side=='BUY' else -1)
-            dist = entry-stop if side=='BUY' else stop-entry
-            if dist >= min_stop and ((target > entry) if side=='BUY' else (target < entry)):
-                qty = equity*risk_pct/100 / dist
-                position = {'entry_time':d.index[i], 'side':side,'entry':entry,'stop':stop,'target':target,'qty_oz':qty}
-            pending = None
-            # Entry-bar exits are processed conservatively, too.
-            if position is not None:
-                hit_stop = row.low <= position['stop'] if side=='BUY' else row.high >= position['stop']
-                hit_target = row.high >= position['target'] if side=='BUY' else row.low <= position['target']
-                if hit_stop or hit_target:
-                    intended = position['stop'] if hit_stop else position['target']
-                    if hit_stop: intended = min(intended,row.open) if side=='BUY' else max(intended,row.open)
-                    fill = intended - (spread/2+slippage) if side=='BUY' else intended+(spread/2+slippage)
-                    pnl = ((fill-entry) if side=='BUY' else (entry-fill))*qty - commission*qty
-                    equity += pnl
-                    peak = max(peak,equity)
-                    trades.append({**position,'exit_time':d.index[i],'exit':fill,'net_pnl':pnl,'equity':equity,'drawdown_pct':(peak-equity)/peak*100,'reason':'Stop' if hit_stop else 'Target'})
-                    position=None
-        if position is not None or pending is not None or i < 201: continue
-        prev = d.iloc[i-1]
-        if not np.isfinite(prev.ema200): continue
-        # Only pivots confirmed by current closed candle are eligible.
-        highs = [(v,j) for typ,v,j in confirmed if typ=='H']
-        lows = [(v,j) for typ,v,j in confirmed if typ=='L']
-        if not highs or not lows: continue
-        h,hj = highs[-1]; l,lj = lows[-1]
-        if hj <= lj and prev.ema50 > prev.ema200 and prev.close > prev.ema200 and h>l:
-            # Last confirmed low precedes high: up impulse, retrace downward.
-            a = h-(h-l)*zone_high; b = h-(h-l)*zone_low
-            if row.low <= b and row.high >= a and row.close > row.open and row.close > a:
-                stop = l - max(0.2,0.05*(h-l))
-                entry_proxy = row.close+spread/2+slippage
-                if entry_proxy>stop+min_stop: pending=('BUY',stop,entry_proxy+2*(entry_proxy-stop))
-        elif lj <= hj and prev.ema50 < prev.ema200 and prev.close < prev.ema200 and h>l:
-            a = l+(h-l)*zone_low; b = l+(h-l)*zone_high
-            if row.high >= a and row.low <= b and row.close < row.open and row.close < b:
-                stop = h + max(0.2,0.05*(h-l))
-                entry_proxy = row.close-spread/2-slippage
-                if stop>entry_proxy+min_stop: pending=('SELL',stop,entry_proxy-2*(stop-entry_proxy))
-    return pd.DataFrame(trades)
-
-def metrics(t):
-    if t.empty: return {'Trades':0,'Win rate':0,'Net P&L':0,'Profit factor':0,'Max drawdown':0}
-    wins = t.loc[t.net_pnl>0,'net_pnl'].sum()
-    losses = -t.loc[t.net_pnl<0,'net_pnl'].sum()
-    return {'Trades':len(t),'Win rate':round((t.net_pnl>0).mean()*100,2),'Net P&L':round(t.net_pnl.sum(),2),'Profit factor':round(wins/losses,2) if losses>0 else float('inf'),'Max drawdown':round(t.drawdown_pct.max(),2)}
-
-if uploaded:
-    try:
-        df = load_candles(uploaded)
-        st.write(f'Loaded {len(df):,} M15 bars: {df.index.min()} to {df.index.max()}')
-        if len(df)<400: st.warning('Very limited history: need substantially more data for meaningful validation.')
-        if st.button('Run Golden Zone vs Deep Retracement backtest', type='primary'):
-            split = int(len(df)*0.7)
-            # Re-run whole series once per candidate, then segment by entry time.
-            # OOS is strictly after split, and no strategy parameters are fitted on OOS.
-            for name,z1,z2 in [('Golden Zone',0.5,0.618),('Deep Retracement',0.618,0.786)]:
-                trades=run_strategy(df,z1,z2)
-                train=trades[trades.entry_time < df.index[split]] if not trades.empty else trades
-                test=trades[trades.entry_time >= df.index[split]] if not trades.empty else trades
-                st.subheader(name)
-                st.dataframe(pd.DataFrame([{'Sample':'Training',**metrics(train)},{'Sample':'Out of sample',**metrics(test)}]),hide_index=True)
-                if not trades.empty:
-                    st.download_button(f'Download {name} trades CSV',trades.to_csv(index=False),file_name=f'Tuesday_AI_V26_{name.replace(" ","_")}_trades.csv',mime='text/csv')
-            st.warning('Experimental backtest. Same-bar fills, liquidity, execution and data quality may differ from real trading. Do not use as funded-account proof.')
-    except Exception as exc:
-        st.error(f'Input issue: {exc}')
+entry_time,exit_time,sample,side,entry,exit,stop,target,qty_oz,net_pnl,equity,drawdown_pct,reason
+2026-08-03 08:45:00,2026-08-03 09:00:00,Training,SELL,4044.6225,4067.0074999999997,4059.2925,4018.2165,0.16650016650016808,-3.7304362304362266,996.2695637695638,0.3730436230436226,Stop
+2026-08-03 09:15:00,2026-08-03 10:00:00,Training,SELL,4038.4725000000003,4065.3675,4053.4682142857146,4011.4802142857147,0.16235710169918907,-4.369841392233597,991.8997223773301,0.8100277622669865,Stop
+2026-08-04 05:15:00,2026-08-04 05:30:00,Training,SELL,4050.1725,4064.5175,4060.952142857143,4030.769142857143,0.222905969907261,-3.2020442577177595,988.6976781196124,1.130232188038758,Stop
+2026-08-04 13:15:00,2026-08-04 14:15:00,Training,BUY,4100.1175,4061.720321428572,4061.882821428572,4168.939921428572,0.06406855336346834,-2.4613330553774535,986.2363450642349,1.3763654935765088,Stop
+2026-08-04 21:45:00,2026-08-04 22:00:00,Training,BUY,4092.8075,4076.1492857142853,4076.311785714285,4122.499785714286,0.14640654908278286,-2.441799798434648,983.7945452658003,1.6205454734199747,Stop
+2026-08-04 22:30:00,2026-08-04 22:45:00,Training,BUY,4064.2374999999997,4107.919142857143,4039.8796428571422,4108.081642857143,0.09956282987596207,4.347076719890771,988.141621985691,1.1858378014308983,Target
+2026-08-04 23:00:00,2026-08-04 23:15:00,Training,BUY,4057.5475,4124.537857142857,4020.240357142857,4124.700357142858,0.06560991931686494,4.39391972876449,992.5355417144555,0.7464458285544537,Target
+2026-08-05 02:30:00,2026-08-05 20:45:00,Training,BUY,4175.217500000001,4293.434571428572,4109.451071428572,4293.597071428572,0.03753267639051586,4.436252432235251,996.9717941466907,0.30282058533092593,Target
+2026-08-05 21:00:00,2026-08-07 04:30:00,Training,BUY,4139.847500000001,4313.977714285715,4043.0182142857147,4314.140214285715,0.0256490641227354,4.465764050637477,1001.4375581973283,0.0,Target
+2026-08-07 04:45:00,2026-08-07 05:00:00,Training,BUY,4309.1875,4263.782499999999,4280.626428571429,4360.597428571428,0.08661135089491,-3.9343206144013436,997.5032375829269,0.3928672918442843,Stop
+2026-08-07 05:45:00,2026-08-07 08:00:00,Training,BUY,4317.5275,4265.4225,4276.1221428571425,4392.057142857143,0.05973022183796951,-3.113437813304189,994.3897997696226,0.7037641408608815,Stop
+2026-08-07 08:45:00,2026-08-07 10:00:00,Training,BUY,4367.007500000001,4266.1425,4334.340714285715,4425.807714285715,0.07530566570799813,-7.597212084951443,986.7925876846712,1.4623947736710887,Stop
+2026-08-10 02:45:00,2026-08-10 03:00:00,Training,BUY,4355.1875,4324.452499999999,4342.472857142858,4378.0738571428565,0.18890114348436846,-5.809654667861862,980.9829330168093,2.0425262676725464,Stop
+2026-08-10 10:45:00,2026-08-10 11:00:00,Training,BUY,4349.387500000001,4333.4075,4333.570000000001,4377.859000000001,0.1517374993065424,-2.4277999889047504,978.5551330279045,2.284957757187981,Stop
+2026-08-10 12:00:00,2026-08-10 14:30:00,Training,BUY,4332.887500000001,4367.718928571429,4313.446428571429,4367.88142857143,0.12364191857900228,4.304151817047336,982.8592848449518,1.8551604341481727,Target
+2026-08-10 14:45:00,2026-08-10 15:15:00,Training,BUY,4379.807500000001,4357.704285714286,4357.866785714286,4419.300785714287,0.11025665054350388,-2.4392315063991075,980.4200533385527,2.0987334344248865,Stop
+2026-08-10 15:30:00,2026-08-10 15:45:00,Training,BUY,4351.177500000001,4393.860142857143,4327.374642857144,4394.022642857143,0.10150176551261386,4.330333571434031,984.7503869099868,1.666321694323087,Target
+2026-08-10 18:45:00,2026-08-10 20:00:00,Training,BUY,4395.337500000001,4356.291785714286,4356.454285714286,4465.327285714286,0.06275778829350163,-2.451677826677318,982.2987090833095,1.9111375399650754,Stop
+2026-08-10 20:15:00,2026-08-10 21:00:00,Training,BUY,4405.297500000001,4374.000892857143,4374.163392857144,4461.338892857144,0.07801195763157134,-2.443069829593147,979.8556392537164,2.1550938215719744,Stop
+2026-08-10 21:30:00,2026-08-10 21:45:00,Training,BUY,4419.057500000001,4389.794464285715,4389.956964285715,4471.438464285716,0.08319220685619282,-2.4361203645201766,977.4195188891962,2.398356154263533,Stop
+2026-08-10 22:00:00,2026-08-10 22:15:00,Training,BUY,4342.9875,4400.962750000001,4310.68875,4401.125250000001,0.07485502729383019,4.338241820570783,981.757760709767,1.9651547244729402,Target
+2026-08-11 18:00:00,2026-08-11 20:00:00,Training,BUY,4369.7275,4401.6275,4351.915,4401.79,0.13517248529667727,4.3092988312580225,986.0670595410251,1.5348434388631667,Target
+2026-08-12 08:30:00,2026-08-12 09:00:00,Training,BUY,4426.9575,4400.362499999999,4410.59142857143,4456.416428571429,0.14751703141175304,-3.926165791023979,982.140893750001,1.9268964189901985,Stop
+2026-08-12 20:15:00,2026-08-12 20:30:00,Training,BUY,4418.9875,4388.112499999999,4406.961785714286,4440.633785714286,0.19848103979011236,-6.1320717243157015,976.0088220256854,2.5392233358429985,Stop
+2026-08-12 20:45:00,2026-08-12 21:00:00,Training,BUY,4439.5375,4396.6325,4419.772857142857,4475.113857142857,0.12133592189567471,-5.208344447371917,970.8004775783135,3.0593101255523227,Stop
+2026-08-13 09:00:00,2026-08-13 09:15:00,Training,BUY,4401.717500000001,4389.011785714286,4389.174285714286,4424.295285714286,0.18831167298606447,-2.3964005470856047,968.4040770312279,3.298606178258725,Stop
+2026-08-13 12:15:00,2026-08-13 12:30:00,Training,SELL,4354.7225,4402.927500000001,4392.932857142857,4285.943857142856,0.06279309470815225,-3.028196992300695,965.3758800389272,3.6009911814487054,Stop
+2026-08-13 15:15:00,2026-08-13 15:30:00,Training,SELL,4346.4625,4388.7375,4387.490714285714,4272.611714285714,0.05833338651018576,-2.4672105824483386,962.9086694564788,3.8473580729491172,Stop
+2026-08-13 20:30:00,2026-08-13 20:45:00,Training,SELL,4382.3324999999995,4343.890785714286,4403.779285714285,4343.728285714285,0.11046693030131471,4.244328834056964,967.1529982905358,3.423534460651497,Target
+2026-08-13 21:15:00,2026-08-13 21:30:00,Training,SELL,4323.7525,4377.9575,4360.808928571429,4257.050928571428,0.06464679527170218,-3.505472473608105,963.6475258169278,3.7735784993350667,Stop
+2026-08-17 10:00:00,2026-08-17 10:15:00,Training,BUY,4408.4475,4392.721428571428,4392.883928571428,4436.461928571429,0.15143527031067094,-2.384510583116955,961.2630152338108,4.011687262442499,Stop
+2026-08-17 10:30:00,2026-08-17 20:00:00,Training,BUY,4391.847500000001,4428.433928571429,4371.431428571429,4428.596428571429,0.1157530595832981,4.232675985176902,965.4956912189878,3.5890272622727353,Target
+2026-08-17 20:30:00,2026-08-17 20:45:00,Training,BUY,4431.087500000001,4415.806071428572,4415.968571428572,4458.301571428572,0.15608835858871867,-2.3883748697767935,963.1073163492109,3.827521899329899,Stop
+2026-08-17 21:00:00,2026-08-17 21:30:00,Training,BUY,4434.2675,4414.571785714285,4414.734285714286,4469.427285714285,0.12112598527541868,-2.38808531826582,960.7192310309451,4.065987622800919,Stop
+2026-08-18 09:45:00,2026-08-18 10:30:00,Training,BUY,4401.3975,4388.614642857143,4388.777142857143,4424.114142857143,0.1852473519328077,-2.3716953828883307,958.3475356480568,4.302816705500552,Stop
+2026-08-18 15:45:00,2026-08-18 21:00:00,Training,SELL,4349.6725,4395.117857142857,4394.955357142857,4268.1633571428565,0.05250890550522376,-2.3873361419755588,955.9601995060813,4.541207618886399,Stop
+2026-08-19 10:15:00,2026-08-19 11:00:00,Training,BUY,4473.677500000001,4427.148714285715,4427.311214285715,4557.136814285715,0.05116323522720543,-2.3815864730407807,953.5786130330405,4.779024390740637,Stop
+2026-08-19 15:15:00,2026-08-19 16:00:00,Training,BUY,4503.2675,4352.822499999999,4375.659285714286,4732.962285714286,0.018631392309218148,-2.80337244380652,950.7752405892339,5.05895921252352,Stop
+2026-08-19 16:30:00,2026-08-19 17:00:00,Training,BUY,4518.0775,4351.532499999999,4405.417857142857,4720.8648571428575,0.021033986227255608,-3.503525915942851,947.2717146732911,5.408808874867872,Stop
+2026-08-20 10:45:00,2026-08-20 11:00:00,Training,BUY,4499.1675000000005,4532.311428571429,4480.663928571429,4532.4739285714295,0.1256423753735216,4.161769067417157,951.4334837407082,4.993229387824398,Target
+2026-08-20 11:15:00,2026-08-20 11:30:00,Training,BUY,4534.7275,4510.809285714286,4510.971785714286,4577.487785714286,0.09869349435679071,-2.3625460165187993,949.0709377241894,5.229144847273668,Stop
+2026-08-21 02:30:00,2026-08-21 11:45:00,Training,BUY,4543.6875,4611.725071428571,4505.798571428571,4611.887571428571,0.062056854552046035,4.220956537126234,953.2918942613156,4.807655109588547,Target
+2026-08-21 12:00:00,2026-08-21 12:30:00,Training,BUY,4614.6475,4533.3925,4554.973214285714,4722.061214285714,0.03970773239452305,-3.227245950364865,950.0646483109508,5.1299164352146915,Stop
+2026-08-21 12:45:00,2026-08-21 13:00:00,Training,BUY,4621.1975,4545.735,4545.8975,4756.7375,0.03139879199917206,-2.3700593170775224,947.6945889938733,5.36658214618961,Stop
+2026-08-23 18:15:00,2026-08-23 20:15:00,Out-of-sample,BUY,4617.2775,4602.4974999999995,4602.66,4643.589,0.15834496056706185,-2.343505416392619,945.3510835774806,5.600596278894114,Stop
+2026-08-23 22:15:00,2026-08-24 14:30:00,Out-of-sample,BUY,4650.2475,4624.773571428572,4624.936071428572,4695.808071428572,0.09211639501437044,-2.34840879475386,943.0026747827268,5.835100045557426,Stop
+2026-08-24 18:45:00,2026-08-24 19:00:00,Out-of-sample,BUY,4661.137500000001,4640.152499999999,4645.653214285715,4689.009214285715,0.14893323233335928,-3.128342545162434,939.8743322375643,6.14748522819365,Stop
+2026-08-24 19:15:00,2026-08-24 20:00:00,Out-of-sample,BUY,4672.2375,4654.771428571428,4654.933928571429,4703.383928571428,0.1331374519520598,-2.3280509946517802,937.5462812429125,6.37995613719795,Stop
+2026-08-24 20:15:00,2026-08-24 20:30:00,Out-of-sample,BUY,4690.467500000001,4669.585714285715,4669.748214285715,4727.762214285715,0.11127202388437411,-2.3257839992260787,935.2204972436864,6.612200672085651,Stop
+2026-08-24 20:45:00,2026-08-24 21:00:00,Out-of-sample,BUY,4693.587500000001,4668.204642857143,4668.367142857143,4738.9841428571435,0.09145388542958237,-2.3231899867269448,932.8973072569595,6.844186178092519,Stop
+2026-08-25 11:45:00,2026-08-25 13:00:00,Out-of-sample,BUY,4656.0275,4633.9275,4634.09,4695.515,0.1046670377265737,-2.3152348745118485,930.5820723824477,7.075377314829933,Stop
+2026-08-25 15:15:00,2026-08-25 15:30:00,Out-of-sample,BUY,4662.2375,4638.362499999999,4644.126071428572,4694.838071428572,0.12605121147639423,-3.011993698228555,927.5700786842191,7.376144314586807,Stop
+2026-08-25 18:45:00,2026-08-25 20:00:00,Out-of-sample,BUY,4669.4475,4642.8099999999995,4642.9725,4717.1025,0.086462535298678,-2.3048750347245717,925.2652036494945,7.606300954494892,Stop
+2026-08-26 11:15:00,2026-08-26 11:30:00,Out-of-sample,SELL,4588.692499999999,4619.572857142856,4619.410357142856,4533.400357142857,0.07446716824809678,-2.301062094283416,922.9641415552111,7.836076847704406,Stop
+2026-08-27 03:00:00,2026-08-27 05:30:00,Out-of-sample,SELL,4620.2225,4591.967500000001,4636.01,4591.805,0.14302869077254216,4.0384150839626125,927.0025566391737,7.432815051608792,Target
+2026-08-27 05:45:00,2026-08-27 08:00:00,Out-of-sample,SELL,4582.0625,4625.097500000001,4612.9925,4526.3885,0.0741009237921006,-3.190415273868948,923.8121413653048,7.7513985966090315,Stop
+2026-08-27 19:45:00,2026-08-27 21:45:00,Out-of-sample,SELL,4599.242499999999,4578.071142857142,4611.094642857142,4577.908642857142,0.18935011096149823,4.005011821986295,927.8171531872911,7.351472331690865,Target
+2026-08-27 22:00:00,2026-08-28 09:45:00,Out-of-sample,SELL,4606.1025,4623.189285714286,4623.026785714285,4575.638785714285,0.13431608703129158,-2.297716518825657,925.5194366684655,7.580914147610141,Stop
+2026-08-28 10:15:00,2026-08-28 10:30:00,Out-of-sample,SELL,4545.5824999999995,4568.667142857143,4568.504642857142,4504.3226428571425,0.09944489557130294,-2.297638796140844,923.2217978723246,7.810348202417992,Stop
+2026-08-28 12:00:00,2026-08-28 12:15:00,Out-of-sample,SELL,4579.4325,4498.789785714286,4624.324285714286,4498.627285714286,0.0510216289295713,4.113502211580534,927.3353000839052,7.399588472277131,Target
+2026-08-28 12:30:00,2026-08-28 13:30:00,Out-of-sample,SELL,4581.362499999999,4465.876285714286,4645.611785714284,4465.713785714285,0.035890763781556013,4.144170621679079,931.4794707055843,6.985766303560096,Target
+2026-08-28 14:30:00,2026-08-28 15:00:00,Out-of-sample,SELL,4455.6825,4579.1675000000005,4561.17,4265.805,0.022003625320803785,-2.7175577452458843,928.7619129603383,7.2571319741404725,Stop
+2026-08-30 22:15:00,2026-08-31 03:15:00,Out-of-sample,SELL,4423.8925,4446.361071428571,4446.198571428571,4383.741571428572,0.10250750344074562,-2.305247313091749,926.4566656472466,7.4873257884449185,Stop
