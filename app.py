@@ -1,110 +1,157 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 
-st.set_page_config(page_title='Tuesday AI V22', page_icon='🥇', layout='wide')
-st.title('🥇 Tuesday AI V22 — Risk-Control Stress Lab')
-st.caption('Research simulator only. No live orders. V21 trade outcomes are historical and do not prove future performance.')
-file = st.file_uploader('Upload V21 stress trades CSV', type=['csv'])
-with st.sidebar:
-    st.header('Simulation settings')
-    starting = st.number_input('Starting balance ($)', min_value=100.0, value=1000.0, step=100.0)
-    risk = st.slider('Risk per trade (%)', 0.25, 2.0, 1.0, 0.25)
-    daily_limit = st.slider('Daily loss limit (%)', 1.0, 10.0, 3.0, 0.5)
-    max_dd = st.slider('Maximum drawdown stop (%)', 3.0, 30.0, 15.0, 1.0)
-    extra_cost_r = st.number_input('Extra execution cost (R per trade)', 0.0, 1.0, 0.05, 0.01, help='Added spread/slippage/commission stress beyond V21 costs, in units of initial stop risk. Not broker-verified.')
-    loss_streak_limit = st.slider('Pause after consecutive losses', 2, 10, 4)
+st.set_page_config(page_title="Tuesday AI V23", page_icon="🥇", layout="wide")
+st.title("🥇 Tuesday AI V23")
+st.caption("Risk Management & Out-of-Sample Validation")
 
-if file is None:
-    st.info('Upload Tuesday_AI_V21_stress_trades.csv to run the V22 simulation.')
-    st.stop()
-try:
-    df = pd.read_csv(file)
-except Exception as exc:
-    st.error(f'Could not read CSV: {exc}')
-    st.stop()
-required = {'entry_time', 'exit_time', 'side', 'entry', 'sl', 'exit', 'net_r'}
-missing = required - set(df.columns)
-if missing:
-    st.error('Missing required columns: ' + ', '.join(sorted(missing)))
-    st.stop()
-if df.empty:
-    st.error('CSV contains no trades.')
-    st.stop()
-for c in ['entry', 'sl', 'exit', 'net_r']:
-    df[c] = pd.to_numeric(df[c], errors='coerce')
-for c in ['entry_time', 'exit_time']:
-    df[c] = pd.to_datetime(df[c], errors='coerce')
-invalid = df[list(required - {'side'})].isna().any(axis=1) | ((df['entry'] - df['sl']).abs() <= 0)
-if invalid.any():
-    st.warning(f'{invalid.sum()} invalid rows excluded.')
-    df = df.loc[~invalid].copy()
-if df.empty:
-    st.stop()
-df = df.sort_values(['entry_time', 'exit_time']).reset_index(drop=True)
-if (df['exit_time'] < df['entry_time']).any():
-    st.error('Exit earlier than entry detected. Fix the source CSV.')
-    st.stop()
-# Conservative sequential simulation: never overlap positions, no look-ahead on open trades.
-balance = starting
-peak = starting
-day = None
-day_start = starting
-daily_block = False
-streak = 0
-halted = False
-last_exit = pd.Timestamp.min
-records = []
-for _, trade in df.iterrows():
-    entry_t = trade['entry_time']
-    if entry_t.date() != day:
-        day = entry_t.date()
-        day_start = balance
-        daily_block = False
-        streak = 0
-    reason = ''
-    if halted:
-        reason = 'Max drawdown halt'
-    elif entry_t < last_exit:
-        reason = 'Overlapping trade skipped'
-    elif daily_block:
-        reason = 'Daily loss lock'
-    elif streak >= loss_streak_limit:
-        reason = 'Loss streak lock'
-    if reason:
-        records.append({'entry_time': entry_t, 'side': trade['side'], 'status': reason, 'net_r': np.nan, 'pnl_usd': 0.0, 'equity': balance, 'drawdown_pct': (peak-balance)/peak*100})
-        continue
-    # net_r from V21 includes its original simulated costs; subtract incremental stress cost.
-    realized_r = float(trade['net_r']) - extra_cost_r
-    position_risk = balance * risk / 100
-    pnl = position_risk * realized_r
-    balance += pnl
-    peak = max(peak, balance)
-    dd = (peak-balance)/peak*100
-    last_exit = trade['exit_time']
-    streak = streak+1 if pnl < 0 else 0
-    if balance <= day_start * (1-daily_limit/100):
-        daily_block = True
-    if dd >= max_dd or balance <= 0:
-        halted = True
-    records.append({'entry_time': entry_t, 'side': trade['side'], 'status': 'Executed', 'net_r': realized_r, 'pnl_usd': pnl, 'equity': balance, 'drawdown_pct': dd})
-result = pd.DataFrame(records)
-executed = result[result['status']=='Executed']
-wins = int((executed['pnl_usd']>0).sum())
-losses = int((executed['pnl_usd']<0).sum())
-max_observed_dd = result['drawdown_pct'].max()
-profit = balance - starting
-c1,c2,c3,c4 = st.columns(4)
-c1.metric('Final balance', f'${balance:,.2f}')
-c2.metric('Net P&L', f'${profit:+,.2f}')
-c3.metric('Win rate', f'{wins/len(executed)*100:.1f}%' if len(executed) else 'N/A')
-c4.metric('Max drawdown', f'{max_observed_dd:.2f}%')
-st.write(f'Executed: **{len(executed)}** | Skipped: **{len(result)-len(executed)}** | Losses: **{losses}**')
-if halted:
-    st.warning('Maximum drawdown threshold was reached: later trades were halted. A loss may overshoot the limit.')
-st.subheader('Equity curve')
-st.line_chart(pd.concat([pd.Series([starting]),result['equity']], ignore_index=True))
-st.subheader('Trade audit')
-st.dataframe(result, use_container_width=True)
-st.download_button('Download V22 audited trades CSV', result.to_csv(index=False).encode(), 'Tuesday_AI_V22_audited_trades.csv', 'text/csv')
-st.info('Limitations: V21 net_r already contains modeled costs. The extra cost is an additional R-based stress assumption, not independent bid/ask fill simulation. Intrabar stop/target ordering, gaps, variable spread, partial fills, broker lot rules and actual order latency are not verified. Day boundaries follow the CSV timestamps. Daily and drawdown locks act after a trade closes; they cannot cap a single trade loss.')
+st.warning("Research only. This replays V22 trade outcomes, not a fresh market backtest. No live signals or profit guarantee.")
+
+uploaded = st.file_uploader("Upload V22 audited trades CSV", type=["csv"])
+
+st.sidebar.header("⚙️ Risk Settings")
+capital = st.sidebar.number_input("Starting capital ($)", min_value=100.0, value=1000.0, step=100.0)
+risk = st.sidebar.slider("Risk per trade (%)", 0.1, 2.0, 0.5, 0.1)
+baseline = st.sidebar.number_input("Assumed V22 baseline risk (%)", min_value=0.1, value=1.0, step=0.1)
+daily_limit = st.sidebar.slider("Daily loss limit (%)", 1.0, 10.0, 3.0, 0.5)
+max_streak = st.sidebar.slider("Maximum consecutive losses", 1, 10, 3)
+max_dd = st.sidebar.slider("Max drawdown lock (%)", 5.0, 40.0, 15.0)
+extra_cost = st.sidebar.number_input("Additional cost per executed trade ($)", min_value=0.0, value=0.0, step=0.1)
+split_pct = st.sidebar.slider("In-sample portion (%)", 50, 85, 70, 5)
+
+if uploaded is not None:
+    try:
+        df = pd.read_csv(uploaded)
+        required = {"entry_time", "status", "pnl_usd", "equity"}
+        if not required.issubset(df.columns):
+            st.error("Missing columns: " + ", ".join(sorted(required - set(df.columns))))
+            st.stop()
+
+        df["entry_time"] = pd.to_datetime(df["entry_time"], errors="coerce")
+        for col in ["pnl_usd", "equity"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["entry_time"]).sort_values("entry_time", kind="stable").reset_index(drop=True)
+        if df.empty:
+            st.error("No valid timestamp rows.")
+            st.stop()
+
+        # V22 realized return relative to prior V22 equity.
+        # This is an approximation, NOT a verified R-multiple.
+        previous_equity = df["equity"] - df["pnl_usd"].fillna(0)
+        df["base_return"] = np.where(
+            (df["status"] == "Executed") & (previous_equity > 0),
+            df["pnl_usd"] / previous_equity,
+            0.0
+        )
+
+        def simulate(data):
+            equity = float(capital)
+            peak = equity
+            streak = 0
+            locked = False
+            current_day = None
+            day_start = equity
+            rows = []
+
+            for _, trade in data.iterrows():
+                day = trade["entry_time"].date()
+                if day != current_day:
+                    current_day = day
+                    day_start = equity
+                    streak = 0
+
+                original_status = str(trade["status"])
+                pnl = 0.0
+                status = "V22 skipped"
+
+                if original_status == "Executed":
+                    if locked:
+                        status = "Drawdown lock"
+                    elif (day_start - equity) / max(day_start, 0.01) * 100 >= daily_limit:
+                        status = "Daily loss lock"
+                    elif streak >= max_streak:
+                        status = "Streak lock"
+                    else:
+                        # Risk-scaled replay of V22 percentage returns.
+                        pnl = equity * float(trade["base_return"]) * risk / baseline - extra_cost
+                        pnl = max(pnl, -equity)
+                        equity += pnl
+                        status = "Executed"
+                        streak = streak + 1 if pnl < 0 else 0
+
+                peak = max(peak, equity)
+                drawdown = (peak - equity) / peak * 100
+                if drawdown >= max_dd:
+                    locked = True
+
+                rows.append({
+                    "entry_time": trade["entry_time"],
+                    "side": trade.get("side", ""),
+                    "v22_status": original_status,
+                    "v23_status": status,
+                    "v23_pnl": round(pnl, 4),
+                    "v23_equity": round(equity, 4),
+                    "v23_drawdown_pct": round(drawdown, 4)
+                })
+            return pd.DataFrame(rows)
+
+        result = simulate(df)
+        executed = result[result["v23_status"] == "Executed"]
+        wins = int((executed["v23_pnl"] > 0).sum())
+        losses = int((executed["v23_pnl"] < 0).sum())
+        total = len(executed)
+        final_equity = float(result["v23_equity"].iloc[-1])
+        profit = final_equity - capital
+        winrate = wins / total * 100 if total else 0
+        worst_dd = float(result["v23_drawdown_pct"].max())
+
+        st.subheader("📊 V23 Risk Replay")
+        a, b, c = st.columns(3)
+        a.metric("Final Equity", f"${final_equity:,.2f}")
+        b.metric("Net P/L", f"${profit:,.2f}")
+        c.metric("Max DD", f"{worst_dd:.2f}%")
+        a, b, c = st.columns(3)
+        a.metric("Executed", total)
+        b.metric("Win Rate", f"{winrate:.1f}%")
+        c.metric("Skipped", len(result) - total)
+
+        st.subheader("📈 Equity Curve")
+        st.line_chart(result.set_index("entry_time")["v23_equity"])
+
+        st.subheader("🧪 Chronological 70/30-style Split")
+        split = max(1, min(len(df)-1, int(len(df)*split_pct/100)))
+        cut_time = df.iloc[split]["entry_time"]
+        st.caption(f"Split boundary: {cut_time}. Settings are shared across both sets; tune only on training data.")
+
+        def period_stats(part):
+            trades = part[part["v23_status"] == "Executed"]
+            return {
+                "Trades": len(trades),
+                "Net P/L ($)": round(float(trades["v23_pnl"].sum()), 2),
+                "Win rate (%)": round(100 * (trades["v23_pnl"] > 0).mean(), 2) if len(trades) else 0
+            }
+
+        comparison = pd.DataFrame({
+            "In-sample": period_stats(result.iloc[:split]),
+            "Out-of-sample": period_stats(result.iloc[split:])
+        }).T
+        st.dataframe(comparison, use_container_width=True)
+
+        st.info("Out-of-sample is a chronological holdout of already observed V22 trades. It is NOT independent strategy validation. Tune settings on training only, freeze them, then evaluate holdout once.")
+
+        st.subheader("📋 Audited Trades")
+        st.dataframe(result, use_container_width=True)
+
+        csv = result.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download Tuesday_AI_V23_audited_trades.csv",
+            data=csv,
+            file_name="Tuesday_AI_V23_audited_trades.csv",
+            mime="text/csv"
+        )
+    except Exception as e:
+        st.error(f"Could not process CSV: {e}")
+else:
+    st.info("Upload Tuesday_AI_V22_audited_trades.csv to begin.")
