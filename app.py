@@ -751,3 +751,151 @@ if v10_pdf is not None and v10_csv is not None:
 
     except Exception as e:
         st.error(f"V10 analysis error: {e}")
+
+
+# TUESDAY AI V11 - HISTORICAL BACKTESTING
+st.divider()
+st.header("📊 TUESDAY AI V11 - Backtesting")
+
+backtest_file = st.file_uploader(
+    "Upload historical OHLC CSV",
+    type=["csv"],
+    key="v11_backtest_csv"
+)
+
+if backtest_file is not None:
+    try:
+        import pandas as pd
+
+        data = pd.read_csv(backtest_file)
+        data.columns = data.columns.str.strip().str.lower()
+
+        required = ["open", "high", "low", "close"]
+
+        if not all(c in data.columns for c in required):
+            st.error("CSV needs open, high, low, close columns.")
+        else:
+            data[required] = data[required].apply(
+                pd.to_numeric, errors="coerce"
+            )
+            data = data.dropna(subset=required).copy()
+
+            if len(data) < 220:
+                st.warning("Need at least 220 candles.")
+            else:
+                data["ema50"] = data["close"].ewm(
+                    span=50, adjust=False
+                ).mean()
+                data["ema200"] = data["close"].ewm(
+                    span=200, adjust=False
+                ).mean()
+
+                trades = []
+                risk_points = st.number_input(
+                    "SL distance (price units)",
+                    min_value=0.01,
+                    value=5.0,
+                    key="v11_risk"
+                )
+                reward_ratio = st.number_input(
+                    "Reward / Risk",
+                    min_value=0.5,
+                    value=2.0,
+                    key="v11_rr"
+                )
+
+                i = 220
+                while i < len(data) - 1:
+                    candle = data.iloc[i]
+                    direction = None
+
+                    if (
+                        candle["ema50"] > candle["ema200"]
+                        and candle["low"] <= candle["ema50"]
+                        and candle["close"] > candle["ema50"]
+                        and candle["close"] > candle["open"]
+                    ):
+                        direction = "BUY"
+
+                    elif (
+                        candle["ema50"] < candle["ema200"]
+                        and candle["high"] >= candle["ema50"]
+                        and candle["close"] < candle["ema50"]
+                        and candle["close"] < candle["open"]
+                    ):
+                        direction = "SELL"
+
+                    if direction is None:
+                        i += 1
+                        continue
+
+                    entry = float(data.iloc[i + 1]["open"])
+
+                    if direction == "BUY":
+                        sl = entry - risk_points
+                        tp = entry + risk_points * reward_ratio
+                    else:
+                        sl = entry + risk_points
+                        tp = entry - risk_points * reward_ratio
+
+                    result = "OPEN"
+                    exit_index = None
+
+                    for j in range(i + 1, len(data)):
+                        bar = data.iloc[j]
+
+                        if direction == "BUY":
+                            sl_hit = bar["low"] <= sl
+                            tp_hit = bar["high"] >= tp
+                        else:
+                            sl_hit = bar["high"] >= sl
+                            tp_hit = bar["low"] <= tp
+
+                        # Conservative assumption: SL first
+                        if sl_hit:
+                            result = "LOSS"
+                            exit_index = j
+                            break
+                        elif tp_hit:
+                            result = "WIN"
+                            exit_index = j
+                            break
+
+                    trades.append({
+                        "Direction": direction,
+                        "Entry": round(entry, 3),
+                        "SL": round(sl, 3),
+                        "TP": round(tp, 3),
+                        "Result": result
+                    })
+
+                    if exit_index is None:
+                        break
+
+                    i = exit_index + 1
+
+                results = pd.DataFrame(trades)
+
+                if results.empty:
+                    st.info("No matching setups found.")
+                else:
+                    wins = (results["Result"] == "WIN").sum()
+                    losses = (results["Result"] == "LOSS").sum()
+                    completed = wins + losses
+
+                    win_rate = (
+                        wins / completed * 100
+                        if completed else 0
+                    )
+
+                    st.metric(
+                        "Historical Win Rate",
+                        f"{win_rate:.2f}%"
+                    )
+                    st.write("Wins:", int(wins))
+                    st.write("Losses:", int(losses))
+                    st.write("Completed trades:", int(completed))
+                    st.dataframe(results)
+
+    except Exception as e:
+        st.error(f"Backtesting error: {e}")
