@@ -1041,3 +1041,155 @@ if v12_csv is not None:
             st.download_button('Download V12 trade log', results12.to_csv(index=False).encode(), 'Tuesday_AI_V12_trades.csv', 'text/csv', key='v12_download')
     except Exception as exc:
         st.error(f'V12 backtest error: {exc}')
+import streamlit as st
+import pandas as pd
+import numpy as np
+from io import StringIO
+
+st.set_page_config(page_title='Tuesday AI V13', page_icon='🥇', layout='wide')
+st.title('🥇 Tuesday AI V13 — Gold Strategy Backtester')
+st.caption('Research tool only. No live feed, no guaranteed signals. Uses OHLC candle CSVs.')
+
+with st.sidebar:
+    st.header('Strategy settings')
+    timeframe = st.selectbox('Candle timeframe', ['M15', 'M1'])
+    rr = st.number_input('Take-profit / risk (R)', min_value=0.5, max_value=10.0, value=2.0, step=0.25)
+    atr_mult = st.number_input('Stop distance (ATR multiple)', min_value=0.25, max_value=10.0, value=1.5, step=0.25)
+    breakout_n = st.number_input('Breakout lookback candles', min_value=5, max_value=200, value=20)
+    max_hold = st.number_input('Maximum holding candles', min_value=1, max_value=1000, value=48)
+    st.caption('Signals form on completed candles; entries fill at next candle open.')
+
+uploaded = st.file_uploader('Upload historical XAUUSD OHLC CSV (not a trade-log CSV)', type=['csv'])
+st.info('CSV needs time, open, high, low, close columns. Optional volume. MT5 exports with <DATE>, <TIME>, <OPEN>, etc. are supported.')
+
+def load_ohlc(file):
+    raw = pd.read_csv(file, sep=None, engine='python')
+    raw.columns = [str(c).strip().lower().replace('<','').replace('>','') for c in raw.columns]
+    if 'date' in raw and 'time' in raw:
+        raw['datetime'] = pd.to_datetime(raw['date'].astype(str) + ' ' + raw['time'].astype(str), errors='coerce')
+    elif 'datetime' in raw:
+        raw['datetime'] = pd.to_datetime(raw['datetime'], errors='coerce')
+    elif 'timestamp' in raw:
+        raw['datetime'] = pd.to_datetime(raw['timestamp'], errors='coerce')
+    elif 'time' in raw:
+        raw['datetime'] = pd.to_datetime(raw['time'], errors='coerce')
+    else:
+        raise ValueError('Time column missing. Use datetime, timestamp, time, or date + time.')
+    for col in ['open','high','low','close']:
+        if col not in raw: raise ValueError(f'Missing {col} column: upload candle data, not a trade log.')
+        raw[col] = pd.to_numeric(raw[col], errors='coerce')
+    df = raw[['datetime','open','high','low','close']].dropna().sort_values('datetime').drop_duplicates('datetime').reset_index(drop=True)
+    df = df[(df.high >= df[['open','close','low']].max(axis=1)) & (df.low <= df[['open','close','high']].min(axis=1))].reset_index(drop=True)
+    if len(df) < 230: raise ValueError('At least 230 valid historical candles needed.')
+    return df
+
+def prepare(df):
+    df = df.copy()
+    df['ema50'] = df.close.ewm(span=50, adjust=False).mean()
+    df['ema200'] = df.close.ewm(span=200, adjust=False).mean()
+    prev_close = df.close.shift(1)
+    tr = pd.concat([df.high-df.low, (df.high-prev_close).abs(), (df.low-prev_close).abs()], axis=1).max(axis=1)
+    df['atr'] = tr.ewm(alpha=1/14, adjust=False).mean()
+    df['prev_high'] = df.high.shift(1).rolling(breakout_n).max()
+    df['prev_low'] = df.low.shift(1).rolling(breakout_n).min()
+    return df
+
+def backtest(df):
+    trades = []
+    expected = pd.Timedelta(minutes=15 if timeframe == 'M15' else 1)
+    i = max(210, breakout_n+2)
+    while i < len(df)-1:
+        bar = df.iloc[i]
+        prev = df.iloc[i-1]
+        bullish = bar.ema50 > bar.ema200 and bar.close > bar.ema50
+        bearish = bar.ema50 < bar.ema200 and bar.close < bar.ema50
+        setup, side = None, None
+        if bullish and bar.close > bar.prev_high and prev.close <= prev.prev_high:
+            setup, side = 'Breakout', 'BUY'
+        elif bearish and bar.close < bar.prev_low and prev.close >= prev.prev_low:
+            setup, side = 'Breakout', 'SELL'
+        elif bullish and bar.low <= bar.ema50 and bar.close > bar.ema50 and bar.close > bar.open:
+            setup, side = 'Pullback', 'BUY'
+        elif bearish and bar.high >= bar.ema50 and bar.close < bar.ema50 and bar.close < bar.open:
+            setup, side = 'Pullback', 'SELL'
+        if not setup or not np.isfinite(bar.atr) or bar.atr <= 0:
+            i += 1
+            continue
+        entry_i = i+1
+        entry_bar = df.iloc[entry_i]
+        if entry_bar.datetime - bar.datetime != expected:
+            i += 1
+            continue
+        entry = float(entry_bar.open)
+        risk = float(bar.atr * atr_mult)
+        sl = entry-risk if side == 'BUY' else entry+risk
+        tp = entry+rr*risk if side == 'BUY' else entry-rr*risk
+        outcome, exit_price, exit_i = 'DATA_GAP', np.nan, entry_i
+        last = min(len(df)-1, entry_i+int(max_hold)-1)
+        for j in range(entry_i, last+1):
+            b = df.iloc[j]
+            if j > entry_i and b.datetime-df.iloc[j-1].datetime != expected:
+                outcome, exit_i = 'DATA_GAP', j
+                break
+            hit_sl = b.low <= sl if side == 'BUY' else b.high >= sl
+            hit_tp = b.high >= tp if side == 'BUY' else b.low <= tp
+            if hit_sl and hit_tp:
+                outcome, exit_price, exit_i = 'AMBIGUOUS_SL_FIRST', sl, j
+                break
+            if hit_sl:
+                outcome, exit_price, exit_i = 'LOSS', sl, j
+                break
+            if hit_tp:
+                outcome, exit_price, exit_i = 'WIN', tp, j
+                break
+        else:
+            exit_i = last
+            if last == len(df)-1 and last < entry_i+int(max_hold)-1:
+                outcome = 'INCOMPLETE'
+            else:
+                outcome = 'TIME_EXIT'
+                exit_price = float(df.iloc[last].close)
+        r = ((exit_price-entry)/risk if side == 'BUY' else (entry-exit_price)/risk) if np.isfinite(exit_price) else np.nan
+        trades.append({'Signal time':bar.datetime, 'Entry time':entry_bar.datetime, 'Exit time':df.iloc[exit_i].datetime,
+                       'Setup':setup,'Side':side,'Entry':entry,'SL':sl,'TP':tp,'Exit':exit_price,'Outcome':outcome,'R':r})
+        i = max(i+1, exit_i+1)  # One position at a time; no overlapping trades.
+    return pd.DataFrame(trades)
+
+if uploaded:
+    try:
+        candles = prepare(load_ohlc(uploaded))
+        st.write(f'Loaded **{len(candles):,}** candles, from **{candles.datetime.iloc[0]}** to **{candles.datetime.iloc[-1]}**.')
+        trades = backtest(candles)
+        if trades.empty:
+            st.warning('No trades matched these settings. Try more candles or review the setup parameters.')
+        else:
+            resolved = trades[trades.R.notna()].copy()
+            gaps = int((trades.Outcome == 'DATA_GAP').sum())
+            wins = int((resolved.R > 0).sum())
+            winrate = 100*wins/len(resolved) if len(resolved) else 0
+            net_r = float(resolved.R.sum())
+            gross_win = float(resolved.loc[resolved.R>0,'R'].sum())
+            gross_loss = abs(float(resolved.loc[resolved.R<0,'R'].sum()))
+            profit_factor = gross_win/gross_loss if gross_loss else np.nan
+            equity = resolved.R.cumsum()
+            max_dd = float((equity-equity.cummax().clip(lower=0)).min()) if len(equity) else 0
+            a,b,c,d,e = st.columns(5)
+            a.metric('Total trades',len(trades))
+            b.metric('Resolved win rate',f'{winrate:.1f}%')
+            c.metric('Net R',f'{net_r:+.2f}R')
+            d.metric('Profit factor',f'{profit_factor:.2f}' if np.isfinite(profit_factor) else 'N/A')
+            e.metric('Max drawdown',f'{max_dd:.2f}R')
+            st.warning(f'{gaps} data-gap trades excluded from performance calculations. Ambiguous same-candle SL/TP is conservatively scored SL first. Fees, spreads and slippage are NOT included.')
+            if len(resolved):
+                st.subheader('Cumulative R')
+                st.line_chart(equity.reset_index(drop=True))
+                st.subheader('Setup performance')
+                st.dataframe(resolved.groupby(['Setup','Side']).agg(Trades=('R','size'),Net_R=('R','sum'),Average_R=('R','mean')).reset_index(),use_container_width=True)
+            st.subheader('All trades')
+            st.dataframe(trades,use_container_width=True)
+            st.download_button('Download V13 trade results CSV',trades.to_csv(index=False).encode('utf-8'),file_name='Tuesday_AI_V13_trades.csv',mime='text/csv')
+    except Exception as exc:
+        st.error(f'Could not process CSV: {exc}')
+else:
+    st.caption('Upload real historical candle data to run V13. A previous V12 trades CSV cannot be used to reconstruct OHLC candles.')
+
