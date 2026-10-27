@@ -1,195 +1,81 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
+from io import BytesIO
 
-st.set_page_config(page_title="Tuesday AI V19", page_icon="🥇", layout="wide")
-st.title("🥇 Tuesday AI V19")
-st.caption("XAUUSD Smart Signal Engine | Historical Backtesting")
-st.warning("Research only. Signals are not verified live trading recommendations.")
-
-uploaded = st.file_uploader("Upload XAUUSD M1 or M15 CSV", type=["csv", "txt"])
-
-with st.sidebar:
-    st.header("Strategy Settings")
-    rr = st.slider("Risk / Reward", 1.0, 5.0, 2.0, 0.5)
-    atr_mult = st.slider("ATR Stop Multiplier", 1.0, 4.0, 1.5, 0.5)
-    breakout_len = st.slider("Breakout Lookback", 5, 40, 20)
-    pullback_atr = st.slider("Pullback Distance (ATR)", 0.1, 1.0, 0.4, 0.1)
-    spread = st.number_input("Spread in price units", 0.0, 10.0, 0.30, 0.05)
-    st.caption("Spread is an estimate; commissions and slippage are excluded.")
-
-def load_data(file):
-    file.seek(0)
-    df = pd.read_csv(file, sep=None, engine="python")
-    df.columns = [str(c).strip().lower().replace("<", "").replace(">", "") for c in df.columns]
-    if "date" in df.columns and "time" in df.columns:
-        df["datetime"] = pd.to_datetime(
-            df["date"].astype(str) + " " + df["time"].astype(str),
-            errors="coerce"
-        )
-    elif "datetime" in df.columns:
-        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
-    elif "timestamp" in df.columns:
-        df["datetime"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    else:
-        raise ValueError("CSV needs date/time or datetime columns.")
-
-    for c in ["open", "high", "low", "close"]:
-        if c not in df.columns:
-            raise ValueError(f"Missing column: {c}")
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df = df.dropna(subset=["datetime", "open", "high", "low", "close"])
-    df = df.sort_values("datetime").drop_duplicates("datetime")
-    df = df.set_index("datetime")
-    df = df[(df.high >= df[["open", "close", "low"]].max(axis=1)) &
-            (df.low <= df[["open", "close"]].min(axis=1))]
-    return df
-
-def indicators(df):
-    d = df.copy()
-    d["ema50"] = d.close.ewm(span=50, adjust=False).mean()
-    d["ema200"] = d.close.ewm(span=200, adjust=False).mean()
-    prev = d.close.shift(1)
-    tr = pd.concat([
-        d.high - d.low,
-        (d.high - prev).abs(),
-        (d.low - prev).abs()
-    ], axis=1).max(axis=1)
-    d["atr"] = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
-    d["resistance"] = d.high.shift(1).rolling(breakout_len).max()
-    d["support"] = d.low.shift(1).rolling(breakout_len).min()
-
-    up = d.ema50 > d.ema200
-    down = d.ema50 < d.ema200
-    buy_break = up & (d.close > d.resistance) & (d.close > d.open)
-    sell_break = down & (d.close < d.support) & (d.close < d.open)
-    buy_pull = up & (d.low <= d.ema50 + d.atr * pullback_atr) & (d.close > d.ema50) & (d.close > d.open)
-    sell_pull = down & (d.high >= d.ema50 - d.atr * pullback_atr) & (d.close < d.ema50) & (d.close < d.open)
-
-    d["signal"] = np.select(
-        [buy_break | buy_pull, sell_break | sell_pull],
-        ["BUY", "SELL"], default="WAIT"
-    )
-    d.iloc[:200, d.columns.get_loc("signal")] = "WAIT"
-    return d
-
-def backtest(d):
-    trades = []
-    i = 200
-    while i < len(d) - 1:
-        signal = d.signal.iloc[i]
-        atr = d.atr.iloc[i]
-        if signal == "WAIT" or not np.isfinite(atr) or atr <= 0:
-            i += 1
-            continue
-
-        entry_bar = i + 1
-        direction = 1 if signal == "BUY" else -1
-        entry = float(d.open.iloc[entry_bar]) + direction * spread / 2
-        risk = atr * atr_mult
-        sl = entry - direction * risk
-        tp = entry + direction * risk * rr
-        exit_price = None
-        exit_idx = None
-        outcome = "OPEN"
-
-        for j in range(entry_bar, len(d)):
-            high = float(d.high.iloc[j])
-            low = float(d.low.iloc[j])
-            if direction == 1:
-                hit_sl, hit_tp = low <= sl, high >= tp
-            else:
-                hit_sl, hit_tp = high >= sl, low <= tp
-
-            # Conservative: SL first if both touched in one candle
-            if hit_sl:
-                exit_price, outcome = sl, "SL"
-            elif hit_tp:
-                exit_price, outcome = tp, "TP"
-
-            if exit_price is not None:
-                exit_idx = j
-                break
-
-        if exit_idx is None:
-            exit_idx = len(d) - 1
-            exit_price = float(d.close.iloc[exit_idx]) - direction * spread / 2
-            outcome = "END"
-
-        pnl = direction * (exit_price - entry)
-        trades.append({
-            "signal_time": d.index[i],
-            "entry_time": d.index[entry_bar],
-            "exit_time": d.index[exit_idx],
-            "side": signal,
-            "entry": round(entry, 3),
-            "sl": round(sl, 3),
-            "tp": round(tp, 3),
-            "exit": round(exit_price, 3),
-            "outcome": outcome,
-            "pnl_price": round(pnl, 3),
-            "r_multiple": round(pnl / risk, 4)
-        })
-        i = exit_idx + 1
-    return pd.DataFrame(trades)
-
-if uploaded:
-    try:
-        raw = load_data(uploaded)
-        timeframe = st.selectbox("Backtest timeframe", ["M15", "M1"])
-        if timeframe == "M15":
-            data = raw.resample("15min", label="left", closed="left").agg({
-                "open": "first", "high": "max",
-                "low": "min", "close": "last"
-            }).dropna()
-            # Avoid including an incomplete final 15-minute candle
-            if len(data) and raw.index.max() < data.index[-1] + pd.Timedelta(minutes=14):
-                data = data.iloc[:-1]
-        else:
-            data = raw.copy()
-
-        if len(data) < 250:
-            st.error("Need at least 250 candles.")
-            st.stop()
-
-        d = indicators(data)
-        trades = backtest(d)
-        st.success(f"Loaded {len(d):,} candles")
-        st.subheader("Latest Historical Signal")
-        latest = d.iloc[-1]
-        st.metric("Signal", latest.signal)
-        st.metric("Last Close", f"{latest.close:.2f}")
-
-        if trades.empty:
-            st.info("No trades found. Try another dataset or settings.")
-        else:
-            wins = trades[trades.pnl_price > 0]
-            losses = trades[trades.pnl_price < 0]
-            winrate = len(wins) / len(trades) * 100
-            gross_profit = wins.pnl_price.sum()
-            gross_loss = abs(losses.pnl_price.sum())
-            pf = gross_profit / gross_loss if gross_loss else float("inf")
-            equity = trades.r_multiple.cumsum()
-            dd = (equity - equity.cummax().clip(lower=0)).min()
-
-            st.subheader("Backtest Results")
-            a, b, c, e = st.columns(4)
-            a.metric("Trades", len(trades))
-            b.metric("Win Rate", f"{winrate:.1f}%")
-            c.metric("Profit Factor", f"{pf:.2f}")
-            e.metric("Max Drawdown", f"{dd:.2f} R")
-            st.metric("Total Return (R units)", f"{trades.r_multiple.sum():.2f} R")
-            st.line_chart(equity.reset_index(drop=True))
-            st.dataframe(trades, use_container_width=True)
-            st.download_button(
-                "Download V19 Trades CSV",
-                trades.to_csv(index=False),
-                "Tuesday_AI_V19_trades.csv",
-                "text/csv"
-            )
-    except Exception as exc:
-        st.error(f"Data error: {exc}")
+st.set_page_config(page_title='Tuesday AI V20', page_icon='🥇', layout='wide')
+st.title('🥇 Tuesday AI V20 — Cost-Aware Backtest Audit')
+st.caption('Historical trade-log audit only. Not live signals or proof of executable returns.')
+file = st.file_uploader('Upload Tuesday_AI_V19_trades.csv', type=['csv'])
+st.sidebar.header('Trading cost assumptions')
+spread = st.sidebar.number_input('Round-trip spread cost (XAUUSD price units)', min_value=0.0, value=0.30, step=0.05, format='%.2f', help='Example: 0.30 means $0.30 per ounce in price movement; do not double-count if spread is already in fills.')
+slippage = st.sidebar.number_input('Slippage per side (price units)', min_value=0.0, value=0.10, step=0.05, format='%.2f')
+commission = st.sidebar.number_input('Round-trip commission ($ per lot)', min_value=0.0, value=7.0, step=0.5)
+lots = st.sidebar.number_input('Lots per trade', min_value=0.01, value=0.02, step=0.01)
+contract = st.sidebar.number_input('Ounces per lot (check broker)', min_value=1.0, value=100.0, step=1.0)
+st.sidebar.info('Defaults are examples, NOT verified broker charges. Adjust to your broker and contract.')
+if file is None:
+    st.info('Upload the V19 trades CSV to start. No data is stored by this app.')
+    st.stop()
+try:
+    df = pd.read_csv(file)
+except Exception as e:
+    st.error(f'Cannot read CSV: {e}')
+    st.stop()
+required = ['signal_time','entry_time','exit_time','side','entry','sl','tp','exit','outcome','r_multiple']
+missing = [c for c in required if c not in df.columns]
+if missing:
+    st.error('Missing columns: ' + ', '.join(missing))
+    st.stop()
+df = df.copy()
+for c in ['entry','sl','tp','exit','r_multiple']:
+    df[c] = pd.to_numeric(df[c], errors='coerce')
+for c in ['signal_time','entry_time','exit_time']:
+    df[c] = pd.to_datetime(df[c], errors='coerce')
+df['side'] = df['side'].astype(str).str.upper().str.strip()
+df['risk_price'] = (df['entry']-df['sl']).abs()
+df['direction'] = df['side'].map({'BUY':1,'SELL':-1})
+df['gross_price'] = (df['exit']-df['entry'])*df['direction']
+df['recomputed_gross_r'] = df['gross_price']/df['risk_price'].replace(0,np.nan)
+df['cost_price'] = spread + 2*slippage + commission / (lots*contract)
+df['net_price'] = df['gross_price']-df['cost_price']
+df['net_r'] = df['net_price']/df['risk_price'].replace(0,np.nan)
+df['net_usd'] = df['net_price']*lots*contract
+df['gross_usd'] = df['gross_price']*lots*contract
+issues = pd.Series('', index=df.index, dtype='object')
+def flag(mask, msg):
+    global issues
+    issues = issues + np.where(mask.fillna(True), msg+'; ', '')
+flag(df[required].isna().any(axis=1), 'Missing/invalid data')
+flag(~df['side'].isin(['BUY','SELL']), 'Invalid side')
+flag(df['risk_price'].le(0), 'Zero stop distance')
+flag((df['side'].eq('BUY') & ((df['sl']>=df['entry']) | (df['tp']<=df['entry']))) | (df['side'].eq('SELL') & ((df['sl']<=df['entry']) | (df['tp']>=df['entry']))), 'Invalid SL/TP direction')
+flag((df['entry_time'] < df['signal_time']) | (df['exit_time'] < df['entry_time']), 'Time ordering')
+flag((df['recomputed_gross_r']-df['r_multiple']).abs()>0.03, 'R mismatch')
+flag(df.duplicated(subset=['entry_time','side','entry','exit'], keep=False), 'Possible duplicate')
+df['audit_issues'] = issues.str.rstrip('; ')
+valid = df[df['audit_issues'].eq('')].sort_values('exit_time').copy()
+st.subheader('Data validation')
+a,b,c=st.columns(3)
+a.metric('Uploaded rows',len(df));b.metric('Valid rows',len(valid));c.metric('Flagged rows',len(df)-len(valid))
+if len(valid)==0:
+    st.error('No valid rows. Review audit issues below.')
 else:
-    st.info("Upload historical gold candles to begin V19 backtesting.")
+    valid['cumulative_net_usd'] = valid['net_usd'].cumsum()
+    valid['drawdown_usd'] = valid['cumulative_net_usd']-valid['cumulative_net_usd'].cummax().clip(lower=0)
+    wins=valid.loc[valid.net_usd>0,'net_usd'].sum()
+    losses=-valid.loc[valid.net_usd<0,'net_usd'].sum()
+    pf= wins/losses if losses>0 else float('inf')
+    st.subheader('Net results (valid trades only)')
+    a,b,c,d=st.columns(4)
+    a.metric('Net P/L',f'${valid.net_usd.sum():,.2f}')
+    b.metric('Net win rate',f'{(valid.net_usd>0).mean()*100:.1f}%')
+    c.metric('Profit factor',f'{pf:.2f}')
+    d.metric('Max closed-trade DD',f'${-valid.drawdown_usd.min():,.2f}')
+    st.metric('Total net R',f'{valid.net_r.sum():.2f}R')
+    st.line_chart(valid.set_index('exit_time')['cumulative_net_usd'])
+    st.caption('Closed-trade drawdown excludes unrealized intratrade drawdown. Costs are modeled, not measured fills.')
+st.subheader('Full audit')
+st.dataframe(df, use_container_width=True)
+st.download_button('⬇️ Download V20 audited trades CSV',df.to_csv(index=False).encode('utf-8'),'Tuesday_AI_V20_audited_trades.csv','text/csv')
+st.warning('This trade CSV cannot prove whether historical candle highs/lows really hit TP or SL, whether both were touched in the same bar, or whether entries were fillable. For those checks upload original M1 OHLC data in a future candle-level audit. Broker time zone and contract specifications must also be verified.')
