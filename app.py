@@ -899,3 +899,145 @@ if backtest_file is not None:
 
     except Exception as e:
         st.error(f"Backtesting error: {e}")
+
+# TUESDAY AI V12 - FILTERED HISTORICAL BACKTEST
+# Append this section at the END of your existing app.py (V1-V11).
+# Requires streamlit and pandas, already used in V11.
+import pandas as pd
+import streamlit as st
+
+st.divider()
+st.header('🥇 Tuesday AI V12 - Filtered Backtesting')
+st.caption('Historical research only. No live feed, trading orders, or guaranteed signals.')
+
+v12_csv = st.file_uploader('Upload XAUUSD M15 OHLC CSV', type=['csv'], key='v12_csv')
+with st.expander('V12 backtest settings', expanded=True):
+    v12_mode = st.selectbox('Setup', ['EMA Pullback + Breakout', 'EMA Pullback only', 'Breakout only'], key='v12_mode')
+    v12_atr_mult = st.number_input('Stop distance (ATR multiple)', 0.5, 5.0, 1.5, 0.1, key='v12_atr')
+    v12_rr = st.number_input('Reward / Risk', 0.5, 5.0, 2.0, 0.25, key='v12_rr')
+    v12_spread = st.number_input('Assumed spread (XAUUSD price units)', 0.0, 10.0, 0.30, 0.05, key='v12_spread')
+    v12_slippage = st.number_input('Assumed entry slippage (price units)', 0.0, 10.0, 0.10, 0.05, key='v12_slip')
+    v12_min_atr = st.number_input('Minimum ATR (price units)', 0.0, 100.0, 1.0, 0.5, key='v12_min_atr')
+    v12_max_bars = st.number_input('Maximum holding candles', 1, 500, 48, 1, key='v12_hold')
+    v12_complete = st.checkbox('Require all 15 M1 candles per M15 bar (when M1_Count available)', value=True, key='v12_complete')
+
+if v12_csv is not None:
+    try:
+        df12 = pd.read_csv(v12_csv)
+        df12.columns = df12.columns.str.strip().str.lower()
+        needed = ['open', 'high', 'low', 'close']
+        if not all(x in df12.columns for x in needed):
+            st.error('CSV must have Open, High, Low, Close columns.')
+            st.stop()
+        for col in needed:
+            df12[col] = pd.to_numeric(df12[col], errors='coerce')
+        if 'date' in df12.columns and 'time' in df12.columns:
+            df12['timestamp'] = pd.to_datetime(df12['date'].astype(str) + ' ' + df12['time'].astype(str), errors='coerce', format='mixed')
+        elif 'datetime' in df12.columns:
+            df12['timestamp'] = pd.to_datetime(df12['datetime'], errors='coerce')
+        elif 'timestamp' in df12.columns:
+            df12['timestamp'] = pd.to_datetime(df12['timestamp'], errors='coerce')
+        else:
+            st.error('Need Date + Time, Datetime, or Timestamp columns to validate chronological candles.')
+            st.stop()
+        df12 = df12.dropna(subset=needed + ['timestamp']).sort_values('timestamp').drop_duplicates('timestamp').reset_index(drop=True)
+        ohlc_valid = (df12['high'] >= df12[needed].max(axis=1)) & (df12['low'] <= df12[needed].min(axis=1))
+        if not ohlc_valid.all():
+            st.error(f'{int((~ohlc_valid).sum())} invalid OHLC candles. Fix data before testing.')
+            st.stop()
+        if len(df12) < 250:
+            st.error('Need at least 250 valid candles.')
+            st.stop()
+        df12['ema50'] = df12['close'].ewm(span=50, adjust=False).mean()
+        df12['ema200'] = df12['close'].ewm(span=200, adjust=False).mean()
+        prior_close = df12['close'].shift(1)
+        tr = pd.concat([(df12['high']-df12['low']), (df12['high']-prior_close).abs(), (df12['low']-prior_close).abs()], axis=1).max(axis=1)
+        df12['atr'] = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+        df12['resistance'] = df12['high'].shift(1).rolling(20).max()
+        df12['support'] = df12['low'].shift(1).rolling(20).min()
+        df12['complete'] = True
+        if v12_complete and 'm1_count' in df12.columns:
+            df12['complete'] = pd.to_numeric(df12['m1_count'], errors='coerce').eq(15)
+        df12['next_contiguous'] = (df12['timestamp'].shift(-1) - df12['timestamp']).eq(pd.Timedelta(minutes=15))
+        trades12 = []
+        i = 220
+        skipped_gap = 0
+        while i < len(df12) - 1:
+            bar = df12.iloc[i]
+            if not bool(bar['complete']) or not bool(bar['next_contiguous']) or not bool(df12.iloc[i+1]['complete']) or pd.isna(bar['atr']) or bar['atr'] < v12_min_atr:
+                i += 1
+                continue
+            bull = bar['close'] > bar['ema50'] > bar['ema200']
+            bear = bar['close'] < bar['ema50'] < bar['ema200']
+            pull_buy = bull and bar['low'] <= bar['ema50'] and bar['close'] > bar['open']
+            pull_sell = bear and bar['high'] >= bar['ema50'] and bar['close'] < bar['open']
+            break_buy = bull and bar['close'] > bar['resistance'] and bar['close'] > bar['open']
+            break_sell = bear and bar['close'] < bar['support'] and bar['close'] < bar['open']
+            if v12_mode == 'EMA Pullback only':
+                break_buy = break_sell = False
+            elif v12_mode == 'Breakout only':
+                pull_buy = pull_sell = False
+            direction = 'BUY' if (pull_buy or break_buy) else ('SELL' if (pull_sell or break_sell) else None)
+            if direction is None:
+                i += 1
+                continue
+            setup = 'Breakout' if (break_buy or break_sell) else 'Pullback'
+            # Adverse fill: buy pays spread/slippage; sell receives less.
+            raw_open = float(df12.iloc[i+1]['open'])
+            cost = float(v12_spread) + float(v12_slippage)
+            entry = raw_open + cost if direction == 'BUY' else raw_open - cost
+            dist = float(bar['atr']) * float(v12_atr_mult)
+            sl = entry - dist if direction == 'BUY' else entry + dist
+            tp = entry + dist * v12_rr if direction == 'BUY' else entry - dist * v12_rr
+            outcome, exit_i, exit_price = 'OPEN', None, None
+            for j in range(i+1, min(len(df12), i+1+int(v12_max_bars))):
+                b = df12.iloc[j]
+                if not bool(b['complete']):
+                    outcome, exit_i, exit_price = 'DATA_GAP', j, float(b['open'])
+                    break
+                if j > i+1 and df12.iloc[j]['timestamp'] - df12.iloc[j-1]['timestamp'] != pd.Timedelta(minutes=15):
+                    outcome, exit_i, exit_price = 'DATA_GAP', j, float(b['open'])
+                    break
+                stop_hit = b['low'] <= sl if direction == 'BUY' else b['high'] >= sl
+                target_hit = b['high'] >= tp if direction == 'BUY' else b['low'] <= tp
+                if stop_hit:  # Includes same-bar TP + SL: assume SL first.
+                    outcome, exit_i, exit_price = 'LOSS', j, float(sl)
+                    break
+                if target_hit:
+                    outcome, exit_i, exit_price = 'WIN', j, float(tp)
+                    break
+            if exit_i is None:
+                exit_i = min(len(df12)-1, i+int(v12_max_bars))
+                outcome = 'TIME_EXIT' if exit_i < len(df12)-1 else 'END_OF_DATA'
+                exit_price = float(df12.iloc[exit_i]['close'])
+            r = ((exit_price-entry) if direction == 'BUY' else (entry-exit_price)) / dist
+            trades12.append({'Signal time': bar['timestamp'], 'Entry time': df12.iloc[i+1]['timestamp'], 'Exit time': df12.iloc[exit_i]['timestamp'], 'Setup': setup, 'Side': direction, 'Entry': round(entry,3), 'SL': round(sl,3), 'TP': round(tp,3), 'Exit': round(exit_price,3), 'Outcome': outcome, 'R': round(r,4)})
+            i = exit_i + 1  # One position at a time.
+        results12 = pd.DataFrame(trades12)
+        if results12.empty:
+            st.warning('No trades matched these settings.')
+        else:
+            # Exclude data gaps and unfinished trades from performance summary.
+            settled = results12[results12['Outcome'].isin(['WIN', 'LOSS', 'TIME_EXIT'])].copy()
+            wins = int((settled['Outcome']=='WIN').sum())
+            losses = int((settled['Outcome']=='LOSS').sum())
+            decisive = wins + losses
+            win_rate = 100*wins/decisive if decisive else 0.0
+            net_r = float(settled['R'].sum())
+            positive = float(settled.loc[settled['R']>0,'R'].sum())
+            negative = -float(settled.loc[settled['R']<0,'R'].sum())
+            pf = positive/negative if negative else float('inf') if positive else 0.0
+            equity = settled['R'].cumsum()
+            dd = (equity - equity.cummax().clip(lower=0)).min() if len(equity) else 0
+            c1,c2,c3,c4 = st.columns(4)
+            c1.metric('Win rate (TP/SL only)', f'{win_rate:.2f}%')
+            c2.metric('Wins / Losses', f'{wins} / {losses}')
+            c3.metric('Net R (settled)', f'{net_r:.2f}R')
+            c4.metric('Profit factor', f'{pf:.2f}')
+            st.write(f'Max drawdown: {float(dd):.2f}R | Trades: {len(results12)} | Settled: {len(settled)} | Data gaps: {int((results12.Outcome=="DATA_GAP").sum())} | Unfinished: {int((results12.Outcome=="END_OF_DATA").sum())}')
+            st.caption('TIME_EXIT trades count in net R / profit factor, but not TP/SL win rate. DATA_GAP and END_OF_DATA excluded. Costs are simplified; no commissions, financing, news or execution modeling.')
+            st.line_chart(equity.reset_index(drop=True), y_label='Cumulative R')
+            st.dataframe(results12, use_container_width=True, hide_index=True)
+            st.download_button('Download V12 trade log', results12.to_csv(index=False).encode(), 'Tuesday_AI_V12_trades.csv', 'text/csv', key='v12_download')
+    except Exception as exc:
+        st.error(f'V12 backtest error: {exc}')
