@@ -1,485 +1,211 @@
 
-import streamlit as st
-import pandas as pd
-import numpy as np
 import io
 import zipfile
+import numpy as np
+import pandas as pd
+import streamlit as st
 
-st.set_page_config(
-    page_title="Tuesday AI V29",
-    page_icon="🥇",
-    layout="wide"
-)
+st.set_page_config(page_title='Tuesday AI V30', page_icon='🥇', layout='wide')
+st.title('🥇 Tuesday AI V30')
+st.caption('XAUUSD M15 | Manual signals + historical backtest | No auto orders')
+st.warning('Experimental research tool. Historical performance does not guarantee future profits.')
 
-st.title("🥇 Tuesday AI V29")
-st.subheader("XAUUSD | Manual BUY / SELL / WAIT")
-st.caption("Rule-based research assistant | No automatic orders")
-
-st.warning(
-    "Signals are experimental, not guaranteed profitable. "
-    "Use completed candles and paper-test before live trading."
-)
-
-# ---------- DATA LOADER ----------
-
-def read_text_data(raw):
-    text = raw.decode("utf-8-sig", errors="replace")
-    lines = [x for x in text.splitlines() if x.strip()]
-
-    if not lines:
-        raise ValueError("File is empty")
-
-    first = lines[0]
-    sep = ";" if ";" in first else (
-        "\t" if "\t" in first else ","
-    )
-
-    df = pd.read_csv(
-        io.StringIO(text),
-        sep=sep,
-        header=None,
-        low_memory=False
-    )
-
-    # HistData formats:
-    # Date Time Open High Low Close Volume
-    # DateTime Open High Low Close Volume
-    # Generic header CSV
-
-    if len(df.columns) >= 7:
-        dt = (
-            df.iloc[:, 0].astype(str) + " " +
-            df.iloc[:, 1].astype(str)
-        )
-        price_cols = [2, 3, 4, 5]
-
-    elif len(df.columns) >= 5:
-        dt = df.iloc[:, 0].astype(str)
-        price_cols = [1, 2, 3, 4]
-
-    else:
-        raise ValueError("Expected date and OHLC columns")
-
-    dates = pd.to_datetime(
-        dt, errors="coerce", format="mixed"
-    )
-
-    if dates.notna().sum() == 0:
-        dates = pd.to_datetime(
-            dt, errors="coerce", dayfirst=True
-        )
-
-    out = pd.DataFrame({
-        "datetime": dates,
-        "open": pd.to_numeric(
-            df.iloc[:, price_cols[0]], errors="coerce"
-        ),
-        "high": pd.to_numeric(
-            df.iloc[:, price_cols[1]], errors="coerce"
-        ),
-        "low": pd.to_numeric(
-            df.iloc[:, price_cols[2]], errors="coerce"
-        ),
-        "close": pd.to_numeric(
-            df.iloc[:, price_cols[3]], errors="coerce"
-        )
-    })
-
-    out = out.dropna()
-    out = out.drop_duplicates("datetime")
-    out = out.sort_values("datetime")
-    out = out.set_index("datetime")
-
-    valid = (
-        (out["high"] >= out[["open", "close", "low"]].max(axis=1))
-        & (out["low"] <= out[["open", "close", "high"]].min(axis=1))
-        & (out["low"] > 0)
-    )
-
-    return out.loc[valid]
-
-
-def load_data(upload):
-    raw = upload.getvalue()
-
-    if upload.name.lower().endswith(".zip"):
-        with zipfile.ZipFile(io.BytesIO(raw)) as z:
-            names = [
-                n for n in z.namelist()
-                if n.lower().endswith((".csv", ".txt"))
-            ]
+@st.cache_data(show_spinner=False)
+def load_ohlc(raw, filename):
+    if filename.lower().endswith('.zip'):
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            names = [n for n in archive.namelist() if n.lower().endswith(('.csv', '.txt')) and not n.startswith('__MACOSX')]
             if not names:
-                raise ValueError("ZIP has no CSV/TXT")
-            raw = z.read(names[0])
-
-    return read_text_data(raw)
-
-
-# ---------- INDICATORS ----------
-
-def add_indicators(df):
-    df = df.copy()
-
-    df["ema50"] = df["close"].ewm(
-        span=50, adjust=False
-    ).mean()
-
-    df["ema200"] = df["close"].ewm(
-        span=200, adjust=False
-    ).mean()
-
-    prev_close = df["close"].shift(1)
-
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - prev_close).abs(),
-        (df["low"] - prev_close).abs()
-    ], axis=1).max(axis=1)
-
-    df["atr"] = tr.ewm(
-        alpha=1 / 14, adjust=False
-    ).mean()
-
+                raise ValueError('ZIP contains no CSV/TXT data')
+            raw = archive.read(names[0])
+    text = raw.decode('utf-8-sig', errors='replace')
+    first = next((line for line in text.splitlines() if line.strip()), '')
+    if not first:
+        raise ValueError('Empty file')
+    sep = ';' if ';' in first else ('\t' if '\t' in first else ',')
+    has_header = any(word in first.lower() for word in ['datetime', 'date,', 'date;', '<date>', 'open,', 'open;'])
+    raw_df = pd.read_csv(io.StringIO(text), sep=sep, header=0 if has_header else None, low_memory=False)
+    if has_header:
+        raw_df.columns = [str(c).strip().lower().replace('<', '').replace('>', '') for c in raw_df.columns]
+        if {'date','time','open','high','low','close'}.issubset(raw_df.columns):
+            dates = raw_df['date'].astype(str) + ' ' + raw_df['time'].astype(str)
+        elif 'datetime' in raw_df.columns:
+            dates = raw_df['datetime'].astype(str)
+        elif 'date' in raw_df.columns:
+            dates = raw_df['date'].astype(str)
+        else:
+            raise ValueError('Missing date/time column')
+        values = raw_df[['open','high','low','close']].copy()
+    else:
+        if raw_df.shape[1] >= 7:
+            dates = raw_df.iloc[:,0].astype(str) + ' ' + raw_df.iloc[:,1].astype(str)
+            values = raw_df.iloc[:,2:6].copy()
+        elif raw_df.shape[1] >= 5:
+            dates = raw_df.iloc[:,0].astype(str)
+            values = raw_df.iloc[:,1:5].copy()
+        else:
+            raise ValueError('Expected date and OHLC columns')
+        values.columns = ['open','high','low','close']
+    dt = pd.to_datetime(dates, format='mixed', errors='coerce')
+    if dt.isna().all():
+        dt = pd.to_datetime(dates, dayfirst=True, errors='coerce')
+    df = pd.DataFrame({c: pd.to_numeric(values[c], errors='coerce').to_numpy() for c in ['open','high','low','close']}, index=pd.DatetimeIndex(dt))
+    df = df.loc[~df.index.isna()].dropna().sort_index()
+    df = df[~df.index.duplicated(keep='last')]
+    df = df[(df.low > 0) & (df.high >= df[['open','close','low']].max(axis=1)) & (df.low <= df[['open','close','high']].min(axis=1))]
+    if df.empty:
+        raise ValueError('No valid OHLC rows')
     return df
 
+def to_m15(df, source):
+    if source == 'M15':
+        return df
+    count = df['close'].resample('15min').count()
+    bars = df.resample('15min').agg({'open':'first','high':'max','low':'min','close':'last'})
+    return bars.loc[count == 15].dropna()
 
-# ---------- SIGNAL ENGINE ----------
+def indicators(df):
+    d = df.copy()
+    d['ema50'] = d.close.ewm(span=50, adjust=False).mean()
+    d['ema200'] = d.close.ewm(span=200, adjust=False).mean()
+    prev = d.close.shift(1)
+    tr = pd.concat([(d.high-d.low), (d.high-prev).abs(), (d.low-prev).abs()],axis=1).max(axis=1)
+    d['atr'] = tr.ewm(alpha=1/14,adjust=False).mean()
+    return d
 
-def analyze(df, lookback, rr, sl_atr):
-    if len(df) < max(250, lookback + 5):
-        return {
-            "signal": "WAIT",
-            "reason": "Not enough completed M15 candles"
-        }
+def signal_at(d, i, lookback, rr, buffer):
+    if i < max(250,lookback+2):
+        return None
+    current = d.iloc[i]
+    prior = d.iloc[i-1]
+    window = d.iloc[i-lookback:i]
+    hi, lo = float(window.high.max()), float(window.low.min())
+    rng = hi-lo
+    atr = float(current.atr)
+    if rng <= 0 or atr <= 0 or not np.isfinite(atr):
+        return None
+    buy_lo, buy_hi = hi-0.618*rng, hi-0.5*rng
+    sell_lo, sell_hi = lo+0.5*rng, lo+0.618*rng
+    up = current.ema50 > current.ema200 and current.close > current.ema200
+    down = current.ema50 < current.ema200 and current.close < current.ema200
+    buy = up and current.low <= buy_hi and current.high >= buy_lo and current.close > current.open and current.close > prior.high
+    sell = down and current.high >= sell_lo and current.low <= sell_hi and current.close < current.open and current.close < prior.low
+    if buy:
+        sl = min(float(current.low),buy_lo)-buffer*atr
+        if sl < current.close:
+            return {'side':'BUY','sl':sl,'signal_close':float(current.close),'signal_time':d.index[i]}
+    if sell:
+        sl = max(float(current.high),sell_hi)+buffer*atr
+        if sl > current.close:
+            return {'side':'SELL','sl':sl,'signal_close':float(current.close),'signal_time':d.index[i]}
+    return None
 
-    d = add_indicators(df)
-    last = d.iloc[-1]
+def backtest(d, lookback, rr, buffer, spread, slippage, fee, max_hold, dollars_per_unit):
+    records=[]
+    i=max(250,lookback+2)
+    while i < len(d)-1:
+        s=signal_at(d,i,lookback,rr,buffer)
+        if s is None:
+            i+=1
+            continue
+        side=s['side']
+        direction=1 if side=='BUY' else -1
+        next_bar=d.iloc[i+1]
+        entry=float(next_bar.open)+direction*(spread/2+slippage)
+        sl=s['sl']
+        risk=(entry-sl)*direction
+        if risk<=0:
+            i+=1
+            continue
+        tp=entry+direction*rr*risk
+        exit_price=None
+        reason='TIME'
+        last_j=min(len(d)-1,i+max_hold)
+        exit_j=last_j
+        for j in range(i+1,last_j+1):
+            b=d.iloc[j]
+            if side=='BUY':
+                hit_sl=b.low<=sl
+                hit_tp=b.high>=tp
+            else:
+                hit_sl=b.high>=sl
+                hit_tp=b.low<=tp
+            if hit_sl:
+                exit_price=sl-direction*(spread/2+slippage)
+                reason='SL (conservative if both hit)'
+            elif hit_tp:
+                exit_price=tp-direction*(spread/2+slippage)
+                reason='TP'
+            if exit_price is not None:
+                exit_j=j
+                break
+        if exit_price is None:
+            exit_price=float(d.iloc[exit_j].close)-direction*(spread/2+slippage)
+        pnl=direction*(exit_price-entry)*dollars_per_unit-fee
+        records.append({'signal_time':s['signal_time'],'entry_time':d.index[i+1], 'exit_time':d.index[exit_j], 'side':side, 'entry':entry, 'sl':sl, 'tp':tp, 'exit':exit_price, 'reason':reason, 'pnl_usd':pnl})
+        i=exit_j+1
+    return pd.DataFrame(records)
 
-    price = float(last["close"])
-    atr = float(last["atr"])
-
-    if not np.isfinite(atr) or atr <= 0:
-        return {
-            "signal": "WAIT",
-            "reason": "Invalid volatility data"
-        }
-
-    # Swing levels exclude current candle
-    history = d.iloc[-lookback-1:-1]
-
-    swing_high = float(history["high"].max())
-    swing_low = float(history["low"].min())
-
-    swing_range = swing_high - swing_low
-
-    if swing_range <= 0:
-        return {
-            "signal": "WAIT",
-            "reason": "Invalid swing range"
-        }
-
-    # Bullish retracement from swing high
-    buy_z1 = swing_high - swing_range * 0.618
-    buy_z2 = swing_high - swing_range * 0.50
-
-    # Bearish retracement from swing low
-    sell_z1 = swing_low + swing_range * 0.50
-    sell_z2 = swing_low + swing_range * 0.618
-
-    bullish_trend = (
-        last["ema50"] > last["ema200"]
-        and price > last["ema200"]
-    )
-
-    bearish_trend = (
-        last["ema50"] < last["ema200"]
-        and price < last["ema200"]
-    )
-
-    bullish_candle = (
-        last["close"] > last["open"]
-        and last["close"] > d.iloc[-2]["high"]
-    )
-
-    bearish_candle = (
-        last["close"] < last["open"]
-        and last["close"] < d.iloc[-2]["low"]
-    )
-
-    # Confirmation candle may close outside zone.
-    # Require its range to overlap Golden Zone.
-    buy_zone = (
-        last["low"] <= buy_z2
-        and last["high"] >= buy_z1
-    )
-
-    sell_zone = (
-        last["high"] >= sell_z1
-        and last["low"] <= sell_z2
-    )
-
-    result = {
-        "signal": "WAIT",
-        "reason": "No fully confirmed setup",
-        "price": price,
-        "ema50": float(last["ema50"]),
-        "ema200": float(last["ema200"]),
-        "atr": atr,
-        "buy_zone": (buy_z1, buy_z2),
-        "sell_zone": (sell_z1, sell_z2),
-        "trend": (
-            "UP" if bullish_trend else
-            "DOWN" if bearish_trend else "SIDEWAYS"
-        )
-    }
-
-    if bullish_trend and buy_zone and bullish_candle:
-        entry = price
-        sl = min(
-            float(last["low"]),
-            buy_z1
-        ) - atr * sl_atr
-
-        risk = entry - sl
-
-        if risk > 0:
-            result.update({
-                "signal": "BUY",
-                "reason": "Uptrend + Golden Zone + bullish break",
-                "entry": entry,
-                "sl": sl,
-                "tp": entry + risk * rr
-            })
-
-    elif bearish_trend and sell_zone and bearish_candle:
-        entry = price
-        sl = max(
-            float(last["high"]),
-            sell_z2
-        ) + atr * sl_atr
-
-        risk = sl - entry
-
-        if risk > 0:
-            result.update({
-                "signal": "SELL",
-                "reason": "Downtrend + Golden Zone + bearish break",
-                "entry": entry,
-                "sl": sl,
-                "tp": entry - risk * rr
-            })
-
-    return result
-
-
-# ---------- SIDEBAR ----------
-
-st.sidebar.header("⚙️ Strategy Settings")
-
-lookback = st.sidebar.number_input(
-    "Swing lookback candles",
-    min_value=20,
-    max_value=200,
-    value=60
-)
-
-rr = st.sidebar.slider(
-    "Risk Reward",
-    min_value=1.0,
-    max_value=4.0,
-    value=2.0,
-    step=0.25
-)
-
-sl_atr = st.sidebar.slider(
-    "Extra SL buffer (ATR)",
-    min_value=0.0,
-    max_value=2.0,
-    value=0.3,
-    step=0.1
-)
-
-st.sidebar.info(
-    "These are experimental defaults, "
-    "not independently validated settings."
-)
-
-# ---------- UPLOAD ----------
-
-st.header("📂 Upload Gold Data")
-
-uploaded = st.file_uploader(
-    "Upload XAUUSD M1 or M15 CSV / TXT / ZIP",
-    type=["csv", "txt", "zip"]
-)
-
-source_tf = st.selectbox(
-    "Uploaded data timeframe",
-    ["M15", "M1"]
-)
-
-st.caption(
-    "M1 files are converted to M15. "
-    "M15 data is used directly."
-)
-
-if uploaded is not None:
+st.sidebar.header('Settings')
+source=st.sidebar.selectbox('Input timeframe',['M15','M1'])
+lookback=st.sidebar.number_input('Swing lookback',20,200,60)
+rr=st.sidebar.slider('Reward / Risk',1.0,4.0,2.0,0.25)
+buffer=st.sidebar.slider('SL ATR buffer',0.0,2.0,0.3,0.1)
+spread=st.sidebar.number_input('Round-trip spread in XAUUSD price units',0.0,10.0,0.30,0.05)
+slippage=st.sidebar.number_input('Slippage per fill in price units',0.0,10.0,0.10,0.05)
+fee=st.sidebar.number_input('Commission per completed trade ($)',0.0,100.0,0.0,0.5)
+dollars_per_unit=st.sidebar.number_input('USD P/L per $1 gold move (position exposure)',0.01,10000.0,1.0,0.01)
+max_hold=st.sidebar.number_input('Max holding candles',1,500,32)
+balance=st.sidebar.number_input('Starting balance ($)',10.0,1000000.0,2500.0,10.0)
+st.sidebar.caption('Adjust cost and exposure assumptions to your broker. No position sizing automation.')
+files=st.file_uploader('Upload XAUUSD historical CSV/TXT/ZIP (one or more months)',type=['csv','txt','zip'],accept_multiple_files=True)
+if files:
     try:
-        df = load_data(uploaded)
-
-        if df.empty:
-            st.error("No valid OHLC rows found")
+        frames=[load_ohlc(f.getvalue(),f.name) for f in files]
+        raw=pd.concat(frames).sort_index()
+        raw=raw[~raw.index.duplicated(keep='last')]
+        d=to_m15(raw,source)
+        # Conservatively exclude last bar, which could be incomplete.
+        d=d.iloc[:-1]
+        if len(d)<260:
+            st.error('Need at least 260 completed M15 candles')
             st.stop()
-
-        if source_tf == "M1":
-            counts = df["close"].resample("15min").count()
-
-            df = df.resample("15min").agg({
-                "open": "first",
-                "high": "max",
-                "low": "min",
-                "close": "last"
-            })
-
-            # Require 15 observed minute bars
-            df = df.loc[counts == 15].dropna()
-
+        d=indicators(d)
+        st.success(f'{len(d):,} completed M15 candles loaded')
+        st.caption(f'Data range: {d.index.min()} to {d.index.max()} (timestamps as supplied)')
+        current=signal_at(d,len(d)-1,int(lookback),float(rr),float(buffer))
+        st.subheader('Latest historical signal')
+        if current:
+            st.success(f"{current['side']} — confirmation at {current['signal_time']}") if current['side']=='BUY' else st.error(f"{current['side']} — confirmation at {current['signal_time']}")
+            st.write('Reference signal close:',round(current['signal_close'],2),'| Proposed SL:',round(current['sl'],2))
+            st.caption('Actual entry would require the next completed candle/open; no future fill assumed here.')
         else:
-            df = df.dropna()
-
-        # Last bar may still be forming.
-        # Remove it conservatively.
-        if len(df) > 0:
-            df = df.iloc[:-1]
-
-        if df.empty:
-            st.error("No completed candles available")
-            st.stop()
-
-        st.success(
-            f"{len(df):,} completed candles loaded"
-        )
-
-        st.write(
-            "Last analyzed candle:",
-            str(df.index[-1])
-        )
-
-        result = analyze(
-            df,
-            lookback=int(lookback),
-            rr=float(rr),
-            sl_atr=float(sl_atr)
-        )
-
-        st.header("🧠 Tuesday AI Signal")
-
-        signal = result["signal"]
-
-        if signal == "BUY":
-            st.success("🟢 BUY SIGNAL")
-
-        elif signal == "SELL":
-            st.error("🔴 SELL SIGNAL")
-
-        else:
-            st.warning("🟡 WAIT — NO TRADE")
-
-        st.write("Reason:", result["reason"])
-
-        if "price" in result:
-            a, b, c = st.columns(3)
-
-            a.metric(
-                "Gold Close",
-                f'{result["price"]:.2f}'
-            )
-
-            b.metric(
-                "Trend",
-                result["trend"]
-            )
-
-            c.metric(
-                "ATR",
-                f'{result["atr"]:.2f}'
-            )
-
-            st.write(
-                "EMA 50:",
-                round(result["ema50"], 2)
-            )
-
-            st.write(
-                "EMA 200:",
-                round(result["ema200"], 2)
-            )
-
-            bz = result["buy_zone"]
-            sz = result["sell_zone"]
-
-            st.write(
-                "BUY Golden Zone:",
-                f"{bz[0]:.2f} – {bz[1]:.2f}"
-            )
-
-            st.write(
-                "SELL Golden Zone:",
-                f"{sz[0]:.2f} – {sz[1]:.2f}"
-            )
-
-        if signal in ["BUY", "SELL"]:
-            st.subheader("📍 Proposed Trade Levels")
-
-            x, y, z = st.columns(3)
-
-            x.metric(
-                "Entry",
-                f'{result["entry"]:.2f}'
-            )
-
-            y.metric(
-                "Stop Loss",
-                f'{result["sl"]:.2f}'
-            )
-
-            z.metric(
-                "Take Profit",
-                f'{result["tp"]:.2f}'
-            )
-
-            st.write(f"Risk Reward: 1:{rr:.2f}")
-
-            st.warning(
-                "Entry is based on historical candle close. "
-                "Actual fill price and spread may differ."
-            )
-
-        st.header("📈 Gold Chart")
-
-        chart = add_indicators(df)
-
-        st.line_chart(
-            chart[["close", "ema50", "ema200"]].tail(250)
-        )
-
-        st.header("📋 Recent Candles")
-        st.dataframe(df.tail(15))
-
-        st.caption(
-            "Historical data is not live. "
-            "This version does not include execution costs "
-            "or an independent signal-performance audit."
-        )
-
-    except Exception as e:
-        st.error(f"Data error: {e}")
-        st.info(
-            "Check the CSV format and selected timeframe."
-        )
-
+            st.warning('WAIT — no fully confirmed setup')
+        st.subheader('Historical backtest')
+        if st.button('Run V30 Backtest',type='primary'):
+            trades=backtest(d,int(lookback),float(rr),float(buffer),float(spread),float(slippage),float(fee),int(max_hold),float(dollars_per_unit))
+            if trades.empty:
+                st.info('No completed trades with these settings.')
+            else:
+                pnl=trades.pnl_usd
+                equity=balance+pnl.cumsum()
+                peaks=pd.concat([pd.Series([balance]),equity.reset_index(drop=True)]).cummax().iloc[1:].to_numpy()
+                drawdown=(equity.to_numpy()-peaks)
+                gains=pnl[pnl>0].sum()
+                losses=-pnl[pnl<0].sum()
+                pf=gains/losses if losses>0 else float('inf') if gains>0 else 0
+                a,b,c,dcol=st.columns(4)
+                a.metric('Trades',len(trades))
+                b.metric('Win rate',f'{(pnl>0).mean()*100:.1f}%')
+                c.metric('Net P/L',f'${pnl.sum():,.2f}')
+                dcol.metric('Profit factor',f'{pf:.2f}')
+                st.metric('Max dollar drawdown',f'${abs(min(0,float(drawdown.min()))):,.2f}')
+                st.metric('Ending balance',f'${balance+pnl.sum():,.2f}')
+                st.line_chart(pd.DataFrame({'Equity':equity.to_numpy()},index=trades.exit_time))
+                st.dataframe(trades,use_container_width=True)
+                st.download_button('Download V30 trades CSV',trades.to_csv(index=False).encode('utf-8'),'Tuesday_AI_V30_trades.csv','text/csv')
+                st.warning('Backtest assumptions: one position at a time, no compounding, no margin model. Both SL and TP in one candle count as SL. Intrabar gaps and execution may differ. Costs are estimates; no independent out-of-sample validation yet.')
+    except Exception as exc:
+        st.error(f'Data processing error: {exc}')
 else:
-    st.info("Upload historical XAUUSD data to begin.")
-
-st.divider()
-st.caption("Tuesday AI V29 | Manual Trading Research")
+    st.info('Upload historical data to analyze signals and run the backtest.')
