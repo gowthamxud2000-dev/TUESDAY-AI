@@ -1,344 +1,360 @@
 
-import io
-import zipfile
-import math
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
+from io import BytesIO
 
-st.set_page_config(page_title="Tuesday AI V34", page_icon="🥇", layout="wide")
-st.title("🥇 Tuesday AI V34 — Risk Diagnostic")
-st.caption("XAUUSD M15 | $100 personal account | Manual trading only")
-st.warning("Research backtest only. No live prices or automatic orders.")
+st.set_page_config(page_title="Tuesday AI V35", page_icon="📈", layout="wide")
+st.title("📈 Tuesday AI V35")
+st.caption("XAUUSD.r | Personal account | Manual trading only")
 
-with st.sidebar:
-    st.header("Account")
-    balance0 = st.number_input("Starting balance ($)", 10.0, 100000.0, 100.0)
-    risk = st.slider("Risk per trade (%)", 0.1, 2.0, 0.5, 0.1)
-    daily = st.slider("Daily loss limit (%)", 0.5, 10.0, 2.0, 0.5)
-    max_trades = st.slider("Max trades per day", 1, 10, 3)
-    min_lot = st.number_input("Minimum lot", 0.001, 1.0, 0.01, format="%.3f")
-    lot_step = st.number_input("Lot step", 0.001, 1.0, 0.01, format="%.3f")
-    contract = st.number_input("Ounces per lot", 1.0, 1000.0, 100.0)
-    spread = st.number_input("Spread ($/oz)", 0.0, 10.0, 0.30)
-    slip = st.number_input("Slippage per side ($/oz)", 0.0, 5.0, 0.10)
-    commission = st.number_input("Round-trip commission ($/lot)", 0.0, 50.0, 7.0)
-    st.caption("Check broker contract size, spread and commission.")
+# Broker specifications
+CONTRACT_SIZE = 100.0
+MIN_LOT = 0.01
+LOT_STEP = 0.01
 
-def load_data(f):
-    raw = f.getvalue()
-    if f.name.lower().endswith(".zip"):
-        with zipfile.ZipFile(io.BytesIO(raw)) as z:
-            names = [n for n in z.namelist()
-                     if n.lower().endswith((".csv", ".txt"))]
-            if not names:
-                raise ValueError("ZIP has no CSV/TXT")
-            raw = z.read(names[0])
+st.sidebar.header("Account & Risk")
+balance = st.sidebar.number_input(
+    "Starting balance ($)", min_value=1.0, value=100.0
+)
+risk_pct = st.sidebar.number_input(
+    "Risk per trade (%)", min_value=0.1,
+    max_value=1.0, value=1.0, step=0.1
+)
+spread = st.sidebar.number_input(
+    "Spread (gold price units)", min_value=0.0,
+    value=0.22, step=0.01
+)
+slippage = st.sidebar.number_input(
+    "Slippage (price units per side)", min_value=0.0,
+    value=0.05, step=0.01
+)
+commission = st.sidebar.number_input(
+    "Commission ($ per lot, round trip)",
+    min_value=0.0, value=0.0, step=0.5
+)
 
-    s = raw.decode("utf-8-sig", errors="replace")
-    first = s.splitlines()[0].strip()
-    if first[:8].isdigit():
-        sep = ";" if ";" in first else ","
-        d = pd.read_csv(io.StringIO(s), sep=sep, header=None)
-        d = d.iloc[:, :5]
-        d.columns = ["time", "open", "high", "low", "close"]
-        d["time"] = pd.to_datetime(
-            d.time.astype(str), format="%Y%m%d %H%M%S",
-            errors="coerce"
-        )
+risk_budget = balance * risk_pct / 100
+
+st.metric("Risk budget per trade", f"${risk_budget:.2f}")
+st.info(
+    "0.01 lot = 1 ounce exposure. "
+    "A $5 gold price movement = approximately $5 P/L "
+    "before trading costs."
+)
+
+def indicators(df):
+    df = df.copy()
+    df["ema50"] = df["close"].ewm(
+        span=50, adjust=False
+    ).mean()
+    df["ema200"] = df["close"].ewm(
+        span=200, adjust=False
+    ).mean()
+    df["prev_high"] = df["high"].shift(1).rolling(20).max()
+    df["prev_low"] = df["low"].shift(1).rolling(20).min()
+    return df
+
+def signal(row):
+    if pd.isna(row["ema200"]) or pd.isna(row["prev_high"]):
+        return "WAIT"
+    if row["ema50"] > row["ema200"] and row["close"] > row["prev_high"]:
+        return "BUY"
+    if row["ema50"] < row["ema200"] and row["close"] < row["prev_low"]:
+        return "SELL"
+    return "WAIT"
+
+def risk_check(entry, stop, account_balance):
+    distance = abs(entry - stop)
+    cost = (
+        spread + 2 * slippage
+    ) * CONTRACT_SIZE * MIN_LOT
+    cost += commission * MIN_LOT
+
+    estimated_loss = distance * CONTRACT_SIZE * MIN_LOT + cost
+    allowed = account_balance * risk_pct / 100
+
+    return estimated_loss, estimated_loss <= allowed
+
+st.header("1. Manual BUY / SELL / WAIT")
+
+direction = st.selectbox(
+    "Signal", ["WAIT", "BUY", "SELL"]
+)
+entry = st.number_input(
+    "Entry price", min_value=0.01, value=4030.0
+)
+stop = st.number_input(
+    "Stop loss", min_value=0.01, value=4027.0
+)
+target = st.number_input(
+    "Take profit", min_value=0.01, value=4036.0
+)
+
+if st.button("Check trade"):
+    valid_direction = (
+        (direction == "BUY" and stop < entry < target)
+        or (direction == "SELL" and target < entry < stop)
+    )
+
+    if direction == "WAIT" or not valid_direction:
+        st.warning("WAIT — invalid or missing trade setup.")
     else:
-        d = pd.read_csv(io.StringIO(s), sep=None, engine="python")
-        d.columns = [str(c).lower().strip().strip("<>")
-                     for c in d.columns]
-        d = d.rename(columns={
-            "datetime": "time", "timestamp": "time"
-        })
-        if "date" in d and "time" in d:
-            d["time"] = pd.to_datetime(
-                d.date.astype(str) + " " + d.time.astype(str),
-                errors="coerce"
+        loss, allowed = risk_check(entry, stop, balance)
+        st.write(f"Estimated risk: ${loss:.2f}")
+        if allowed:
+            st.success(f"{direction} — risk check passed")
+            st.warning(
+                "Risk approval is not a confirmed profitable signal."
             )
         else:
-            d["time"] = pd.to_datetime(d.time, errors="coerce")
+            st.error("WAIT — minimum lot risk exceeds budget.")
 
-    for c in ["open", "high", "low", "close"]:
-        d[c] = pd.to_numeric(d[c], errors="coerce")
-    d = d.dropna(subset=["time", "open", "high", "low", "close"])
-    return d.sort_values("time").drop_duplicates("time").set_index("time")[
-        ["open", "high", "low", "close"]
+st.header("2. Historical CSV Backtest")
+
+uploaded = st.file_uploader(
+    "Upload XAUUSD M15 OHLC CSV",
+    type=["csv"]
+)
+
+def load_data(file):
+    raw = pd.read_csv(file)
+    raw.columns = [
+        str(c).strip().lower() for c in raw.columns
     ]
 
-def prepare(d, tf):
-    if tf == "M1":
-        counts = d.open.resample("15min", closed="left", label="right").count()
-        d = d.resample("15min", closed="left", label="right").agg({
-            "open": "first", "high": "max",
-            "low": "min", "close": "last"
-        })
-        d = d[counts == 15].dropna()
+    aliases = {
+        "open": ["open", "<open>"],
+        "high": ["high", "<high>"],
+        "low": ["low", "<low>"],
+        "close": ["close", "<close>"]
+    }
+
+    for name, options in aliases.items():
+        found = next(
+            (c for c in options if c in raw.columns), None
+        )
+        if found is None:
+            raise ValueError(f"Missing column: {name}")
+        raw[name] = pd.to_numeric(raw[found], errors="coerce")
+
+    if "datetime" in raw.columns:
+        raw["time"] = pd.to_datetime(
+            raw["datetime"], errors="coerce"
+        )
+    elif "date" in raw.columns and "time" in raw.columns:
+        raw["time"] = pd.to_datetime(
+            raw["date"].astype(str) + " " +
+            raw["time"].astype(str), errors="coerce"
+        )
+    elif "<date>" in raw.columns and "<time>" in raw.columns:
+        raw["time"] = pd.to_datetime(
+            raw["<date>"].astype(str) + " " +
+            raw["<time>"].astype(str), errors="coerce"
+        )
     else:
-        d = d.copy()
-        d.index = d.index + pd.Timedelta(minutes=15)
-    return d
+        raise ValueError("CSV needs date/time columns.")
 
-def features(d):
-    x = d.copy()
-    x["ema50"] = x.close.ewm(span=50, adjust=False).mean()
-    x["ema200"] = x.close.ewm(span=200, adjust=False).mean()
-    prev = x.close.shift(1)
-    tr = pd.concat([
-        x.high - x.low,
-        (x.high - prev).abs(),
-        (x.low - prev).abs()
-    ], axis=1).max(axis=1)
-    x["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
-    x["hi"] = x.high.shift(1).rolling(32).max()
-    x["lo"] = x.low.shift(1).rolling(32).min()
-    w = x.hi - x.lo
-    x["buy"] = (
-        (x.ema50 > x.ema200) &
-        (x.low <= x.hi - 0.5*w) &
-        (x.high >= x.hi - 0.618*w) &
-        (x.close > x.open) &
-        (x.close > x.ema50)
+    raw = raw.dropna(
+        subset=["time", "open", "high", "low", "close"]
     )
-    x["sell"] = (
-        (x.ema50 < x.ema200) &
-        (x.high >= x.lo + 0.5*w) &
-        (x.low <= x.lo + 0.618*w) &
-        (x.close < x.open) &
-        (x.close < x.ema50)
-    )
-    x.iloc[:200, x.columns.get_indexer(["buy", "sell"])] = False
-    return x
+    raw = raw.sort_values("time").drop_duplicates("time")
+    raw = raw.set_index("time")
 
-def test(x, start, end, label):
-    st.subheader(label)
-    balance = float(balance0)
-    rows, rejects, equity = [], [], []
-    day = None
-    day_start = balance
-    trades_today = 0
-    loss_streak = 0
-    i = max(200, int(x.index.searchsorted(start)))
-    last = int(x.index.searchsorted(end, side="right")) - 1
-    last = min(last, len(x)-1)
+    if len(raw) < 250:
+        raise ValueError("Need at least 250 candles.")
 
-    while i < last:
-        b = x.iloc[i]
-        t = x.index[i]
-        if day != t.date():
-            day = t.date()
-            day_start = balance
-            trades_today = 0
-            loss_streak = 0
+    return raw
 
-        if not (bool(b.buy) or bool(b.sell)):
-            i += 1
+def backtest(data, initial_balance):
+    df = indicators(data)
+    equity = initial_balance
+    trades = []
+    rejected = []
+    last_exit = -1
+
+    # Signal uses completed candle i.
+    # Entry is at next candle open.
+    for i in range(250, len(df) - 1):
+        if i <= last_exit:
             continue
 
-        side = "BUY" if b.buy else "SELL"
-        reason = ""
-        if trades_today >= max_trades:
-            reason = "MAX_DAILY_TRADES"
-        elif loss_streak >= 2:
-            reason = "CONSECUTIVE_LOSSES"
-        elif balance <= day_start * (1-daily/100):
-            reason = "DAILY_LOSS_STOP"
-
-        raw = float(x.iloc[i+1].open)
-        atr = float(b.atr)
-        if not np.isfinite(atr) or atr <= 0:
-            i += 1
+        row = df.iloc[i]
+        side = signal(row)
+        if side == "WAIT":
             continue
+
+        next_bar = df.iloc[i + 1]
+        raw_entry = float(next_bar["open"])
+
+        # Previous 10 candles define stop.
+        history = df.iloc[i-9:i+1]
+        if side == "BUY":
+            stop = float(history["low"].min())
+            entry_price = raw_entry + spread / 2 + slippage
+            distance = entry_price - stop
+            target_price = entry_price + 2 * distance
+        else:
+            stop = float(history["high"].max())
+            entry_price = raw_entry - spread / 2 - slippage
+            distance = stop - entry_price
+            target_price = entry_price - 2 * distance
+
+        if distance <= 0:
+            continue
+
+        loss, allowed = risk_check(
+            entry_price, stop, equity
+        )
+
+        if not allowed:
+            rejected.append({
+                "time": df.index[i+1],
+                "side": side,
+                "reason": "Minimum lot risk too high",
+                "estimated_risk": round(loss, 2)
+            })
+            continue
+
+        exit_price = None
+        exit_index = None
+        outcome = None
+
+        for j in range(i + 1, len(df)):
+            bar = df.iloc[j]
+            if side == "BUY":
+                hit_sl = bar["low"] <= stop
+                hit_tp = bar["high"] >= target_price
+            else:
+                hit_sl = bar["high"] >= stop
+                hit_tp = bar["low"] <= target_price
+
+            # Conservative: SL wins if both touched.
+            if hit_sl:
+                exit_price = stop
+                outcome = "SL"
+            elif hit_tp:
+                exit_price = target_price
+                outcome = "TP"
+
+            if exit_price is not None:
+                exit_index = j
+                break
+
+        if exit_price is None:
+            exit_index = len(df) - 1
+            exit_price = float(df.iloc[-1]["close"])
+            outcome = "End of data"
 
         if side == "BUY":
-            entry = raw + spread/2 + slip
-            sl = min(float(b.lo), float(b.low)) - 0.2*atr
-            dist = entry-sl
+            pnl = (exit_price - entry_price)
         else:
-            entry = raw - spread/2 - slip
-            sl = max(float(b.hi), float(b.high)) + 0.2*atr
-            dist = sl-entry
+            pnl = (entry_price - exit_price)
 
-        if dist <= 0 or dist > 4*atr:
-            reason = reason or "STOP_DISTANCE_FILTER"
+        pnl = pnl * CONTRACT_SIZE * MIN_LOT
+        pnl -= commission * MIN_LOT
 
-        # Conservative estimated loss includes adverse exit costs.
-        per_lot = (dist + spread/2 + slip)*contract + commission
-        min_risk = max(0, per_lot*min_lot)
-        budget = balance*risk/100
-        remaining = max(0, balance-day_start*(1-daily/100))
+        equity += pnl
+        last_exit = exit_index
 
-        if min_risk > budget and not reason:
-            reason = "MIN_LOT_RISK_TOO_HIGH"
-
-        if min_risk > remaining and not reason:
-            reason = "DAILY_BUDGET_TOO_SMALL"
-
-        lot = 0.0
-        if not reason and per_lot > 0:
-            steps = math.floor((budget/per_lot)/lot_step + 1e-9)
-            lot = round(steps*lot_step, 6)
-            if lot < min_lot:
-                reason = "LOT_STEP_REJECTED"
-            elif lot*per_lot > remaining:
-                reason = "DAILY_BUDGET_TOO_SMALL"
-
-        if reason:
-            rejects.append({
-                "time": t, "side": side, "reason": reason,
-                "sl_distance": round(dist, 3),
-                "min_lot_risk": round(min_risk, 2),
-                "risk_budget": round(budget, 2)
-            })
-            i += 1
-            continue
-
-        tp = entry+2*dist if side == "BUY" else entry-2*dist
-        j = i+1
-        raw_exit = float(x.iloc[j].close)
-        outcome = "END"
-
-        while j <= last:
-            q = x.iloc[j]
-            hit_sl = q.low <= sl if side == "BUY" else q.high >= sl
-            hit_tp = q.high >= tp if side == "BUY" else q.low <= tp
-
-            # Stop first when both hit in same candle.
-            if hit_sl:
-                raw_exit, outcome = sl, "SL"
-                break
-            if hit_tp:
-                raw_exit, outcome = tp, "TP"
-                break
-            if j-i >= 32 or j == last:
-                raw_exit, outcome = float(q.close), "TIME"
-                break
-            j += 1
-
-        exit_price = (
-            raw_exit-spread/2-slip if side == "BUY"
-            else raw_exit+spread/2+slip
-        )
-        pnl = (
-            (exit_price-entry) if side == "BUY"
-            else (entry-exit_price)
-        )*contract*lot - commission*lot
-
-        balance += pnl
-        trades_today += 1
-        loss_streak = loss_streak+1 if pnl < 0 else 0
-
-        rows.append({
-            "entry_time": x.index[i+1],
-            "exit_time": x.index[j],
-            "side": side, "lot": lot,
-            "entry": round(entry, 3),
-            "sl": round(sl, 3), "tp": round(tp, 3),
-            "exit": round(exit_price, 3),
+        trades.append({
+            "entry_time": df.index[i+1],
+            "exit_time": df.index[exit_index],
+            "side": side,
+            "entry": round(entry_price, 2),
+            "stop": round(stop, 2),
+            "target": round(target_price, 2),
             "outcome": outcome,
             "pnl": round(pnl, 2),
-            "balance": round(balance, 2)
+            "equity": round(equity, 2)
         })
-        equity.append({"time": x.index[j], "balance": balance})
-        i = j+1
 
-    r = pd.DataFrame(rows)
-    rejected = pd.DataFrame(rejects)
+        if equity <= 0:
+            break
 
-    signals = len(r)+len(rejected)
-    a, b, c = st.columns(3)
-    a.metric("Signals evaluated", signals)
-    b.metric("Executed trades", len(r))
-    c.metric("Rejected signals", len(rejected))
+    return pd.DataFrame(trades), pd.DataFrame(rejected)
 
-    if not rejected.empty:
-        st.write("### Why signals were rejected")
-        st.bar_chart(rejected.reason.value_counts())
-        st.dataframe(rejected, use_container_width=True)
-        st.download_button(
-            f"Download {label} diagnostic CSV",
-            rejected.to_csv(index=False),
-            file_name=f"V34_{label}_rejected.csv",
-            mime="text/csv"
-        )
-
-    if r.empty:
-        st.warning("No executable trades at the configured risk.")
-    else:
-        wins = r[r.pnl > 0]
-        gross_loss = abs(r.loc[r.pnl < 0, "pnl"].sum())
-        pf = wins.pnl.sum()/gross_loss if gross_loss else float("inf")
-        eq = pd.DataFrame(equity).set_index("time")
-        dd = (eq.balance/eq.balance.cummax()-1).min()*100
-
-        a, b, c = st.columns(3)
-        a.metric("Win rate", f"{len(wins)/len(r)*100:.1f}%")
-        b.metric("Net P&L", f"${r.pnl.sum():.2f}")
-        c.metric("Final balance", f"${balance:.2f}")
-        st.write(f"Profit factor: {pf:.2f}")
-        st.write(f"Closed-equity drawdown: {dd:.2f}%")
-        st.line_chart(eq)
-        st.dataframe(r, use_container_width=True)
-        st.download_button(
-            f"Download {label} trades CSV",
-            r.to_csv(index=False),
-            file_name=f"V34_{label}_trades.csv",
-            mime="text/csv"
-        )
-
-st.header("📂 Upload historical XAUUSD data")
-uploads = st.file_uploader(
-    "Upload September and October M1 ZIP or M15 CSV",
-    type=["zip", "csv", "txt"],
-    accept_multiple_files=True
-)
-tf = st.radio("Uploaded timeframe", ["M1", "M15"], index=1, horizontal=True)
-
-if uploads:
+if uploaded is not None:
     try:
-        data = pd.concat([load_data(f) for f in uploads])
-        data = data.sort_index()
-        data = data[~data.index.duplicated(keep="first")]
-        x = features(prepare(data, tf))
-        st.success(f"Loaded {len(x):,} M15 candles")
+        data = load_data(uploaded)
+        st.success(f"Loaded {len(data)} candles")
+        st.write(
+            "Data range:",
+            str(data.index.min()),
+            "to",
+            str(data.index.max())
+        )
 
-        if len(x) < 250:
-            st.warning("Not enough M15 candles for EMA200.")
-        else:
-            latest = x.iloc[-1]
-            signal = "BUY" if latest.buy else "SELL" if latest.sell else "WAIT"
-            st.metric("Latest historical signal", signal)
-            st.line_chart(x[["close", "ema50", "ema200"]].tail(200))
+        split = int(len(data) * 0.7)
+        train = data.iloc[:split]
+        test = data.iloc[max(0, split-250):]
 
-            # Compute indicators on combined data, then split by dates.
-            years = sorted(set(x.index.year))
-            year = 2026 if 2026 in years else years[-1]
-            sept_start = pd.Timestamp(year=year, month=9, day=1)
-            sept_end = pd.Timestamp(year=year, month=9, day=30, hour=23, minute=59)
-            oct_start = pd.Timestamp(year=year, month=10, day=1)
-            oct_end = pd.Timestamp(year=year, month=10, day=31, hour=23, minute=59)
+        st.subheader("Independent validation")
+        st.caption(
+            "70% earlier candles = development sample; "
+            "30% later candles = test sample. "
+            "250 warm-up candles included."
+        )
 
-            if (x.index.month == 9).any():
-                test(x, sept_start, sept_end, "September")
-            if (x.index.month == 10).any():
-                test(x, oct_start, oct_end, "October")
+        train_trades, train_rejected = backtest(
+            train, balance
+        )
+        test_trades, test_rejected = backtest(
+            test, balance
+        )
 
-            if not (x.index.month.isin([9, 10])).any():
-                test(x, x.index[0], x.index[-1], "Uploaded_Data")
+        for title, trades, rejected in [
+            ("Development", train_trades, train_rejected),
+            ("Out-of-sample", test_trades, test_rejected)
+        ]:
+            st.subheader(title)
+            st.metric("Trades", len(trades))
+            st.metric("Rejected signals", len(rejected))
 
-            st.info(
-                "October is not a fresh independent test if "
-                "strategy rules were adjusted using October results."
-            )
-    except Exception as e:
-        st.error(f"Processing error: {e}")
-else:
-    st.info("Upload historical candles to run diagnostics.")
+            if not trades.empty:
+                total = trades["pnl"].sum()
+                wins = (trades["pnl"] > 0).sum()
+                win_rate = wins / len(trades) * 100
 
-st.caption(
-    "V34 | Personal account | Historical simulation only. "
-    "Margin, floating drawdown and gaps are not fully modeled."
-            )
-            
+                st.metric("Net P/L", f"${total:.2f}")
+                st.metric("Win rate", f"{win_rate:.1f}%")
+                st.line_chart(
+                    trades.set_index("exit_time")["equity"]
+                )
+                st.dataframe(trades)
+                st.download_button(
+                    f"Download {title} trades",
+                    trades.to_csv(index=False),
+                    file_name=(
+                        "V35_" +
+                        title.replace("-", "_") +
+                        "_trades.csv"
+                    ),
+                    mime="text/csv"
+                )
+            else:
+                st.warning(
+                    "No trades passed the risk filter."
+                )
+
+            if not rejected.empty:
+                st.dataframe(rejected)
+                st.download_button(
+                    f"Download {title} rejected",
+                    rejected.to_csv(index=False),
+                    file_name=(
+                        "V35_" +
+                        title.replace("-", "_") +
+                        "_rejected.csv"
+                    ),
+                    mime="text/csv"
+                )
+
+    except Exception as error:
+        st.error(f"CSV error: {error}")
+
+st.warning(
+    "Research tool only. No automatic orders. "
+    "Backtests do not guarantee profits. "
+    "Verify broker costs and data before live trading."
+)
