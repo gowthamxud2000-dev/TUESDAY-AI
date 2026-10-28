@@ -1,211 +1,754 @@
 
-import io
-import zipfile
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
+import io
+import math
 
-st.set_page_config(page_title='Tuesday AI V30', page_icon='🥇', layout='wide')
-st.title('🥇 Tuesday AI V30')
-st.caption('XAUUSD M15 | Manual signals + historical backtest | No auto orders')
-st.warning('Experimental research tool. Historical performance does not guarantee future profits.')
+st.set_page_config(
+    page_title="Tuesday AI V31",
+    page_icon="🥇",
+    layout="wide"
+)
 
-@st.cache_data(show_spinner=False)
-def load_ohlc(raw, filename):
-    if filename.lower().endswith('.zip'):
-        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-            names = [n for n in archive.namelist() if n.lower().endswith(('.csv', '.txt')) and not n.startswith('__MACOSX')]
-            if not names:
-                raise ValueError('ZIP contains no CSV/TXT data')
-            raw = archive.read(names[0])
-    text = raw.decode('utf-8-sig', errors='replace')
-    first = next((line for line in text.splitlines() if line.strip()), '')
-    if not first:
-        raise ValueError('Empty file')
-    sep = ';' if ';' in first else ('\t' if '\t' in first else ',')
-    has_header = any(word in first.lower() for word in ['datetime', 'date,', 'date;', '<date>', 'open,', 'open;'])
-    raw_df = pd.read_csv(io.StringIO(text), sep=sep, header=0 if has_header else None, low_memory=False)
-    if has_header:
-        raw_df.columns = [str(c).strip().lower().replace('<', '').replace('>', '') for c in raw_df.columns]
-        if {'date','time','open','high','low','close'}.issubset(raw_df.columns):
-            dates = raw_df['date'].astype(str) + ' ' + raw_df['time'].astype(str)
-        elif 'datetime' in raw_df.columns:
-            dates = raw_df['datetime'].astype(str)
-        elif 'date' in raw_df.columns:
-            dates = raw_df['date'].astype(str)
+st.title("🥇 Tuesday AI V31")
+st.caption("XAUUSD M15 | Manual BUY / SELL / WAIT")
+
+st.warning(
+    "Research and demo use only. Signals are not guaranteed. "
+    "No live feed or automatic order execution."
+)
+
+# =====================================
+# FUNDED ACCOUNT SETTINGS
+# =====================================
+
+st.sidebar.header("⚙️ Funded Account")
+
+balance = st.sidebar.number_input(
+    "Starting balance ($)",
+    min_value=100.0,
+    value=2500.0,
+    step=100.0
+)
+
+daily_limit = st.sidebar.number_input(
+    "Daily loss limit ($)",
+    min_value=1.0,
+    value=40.0
+)
+
+risk_pct = st.sidebar.number_input(
+    "Risk per trade (%)",
+    min_value=0.05,
+    max_value=2.0,
+    value=0.25,
+    step=0.05
+)
+
+rr = st.sidebar.number_input(
+    "Risk reward ratio",
+    min_value=1.0,
+    max_value=5.0,
+    value=2.0,
+    step=0.25
+)
+
+spread = st.sidebar.number_input(
+    "Spread (gold price units)",
+    min_value=0.0,
+    value=0.25,
+    step=0.05
+)
+
+slippage = st.sidebar.number_input(
+    "Slippage per side (price units)",
+    min_value=0.0,
+    value=0.10,
+    step=0.05
+)
+
+commission = st.sidebar.number_input(
+    "Commission per lot round trip ($)",
+    min_value=0.0,
+    value=7.0
+)
+
+contract_size = st.sidebar.number_input(
+    "Ounces per lot",
+    min_value=1.0,
+    value=100.0
+)
+
+lot_step = st.sidebar.number_input(
+    "Lot step",
+    min_value=0.001,
+    value=0.01,
+    step=0.001,
+    format="%.3f"
+)
+
+max_lots = st.sidebar.number_input(
+    "Maximum lots",
+    min_value=0.01,
+    value=1.0
+)
+
+max_trades = st.sidebar.slider(
+    "Maximum trades per day",
+    1, 10, 3
+)
+
+max_hold = st.sidebar.slider(
+    "Maximum holding candles",
+    4, 96, 32
+)
+
+st.sidebar.info(
+    "Check broker contract size, minimum lot, "
+    "commission, and funded-account rules."
+)
+
+# =====================================
+# CSV LOADER
+# =====================================
+
+def load_csv(upload):
+    raw = upload.getvalue()
+    text = raw.decode(
+        "utf-8-sig", errors="replace"
+    )
+
+    first_line = text.splitlines()[0]
+    sep = (
+        ";" if first_line.count(";") >
+        first_line.count(",") else ","
+    )
+
+    df = pd.read_csv(
+        io.StringIO(text), sep=sep
+    )
+
+    df.columns = [
+        str(c).strip().lower()
+        .replace("<", "").replace(">", "")
+        for c in df.columns
+    ]
+
+    required = {"open", "high", "low", "close"}
+
+    if not required.issubset(df.columns):
+        df = pd.read_csv(
+            io.StringIO(text),
+            sep=sep,
+            header=None
+        )
+
+        if df.shape[1] >= 7:
+            df = df.iloc[:, :7].copy()
+            df.columns = [
+                "date", "time", "open",
+                "high", "low", "close", "volume"
+            ]
+        elif df.shape[1] == 6:
+            df.columns = [
+                "datetime", "open", "high",
+                "low", "close", "volume"
+            ]
+        elif df.shape[1] == 5:
+            df.columns = [
+                "datetime", "open", "high",
+                "low", "close"
+            ]
         else:
-            raise ValueError('Missing date/time column')
-        values = raw_df[['open','high','low','close']].copy()
+            raise ValueError(
+                "CSV must contain OHLC data."
+            )
+
+    if "datetime" in df.columns:
+        dt = df["datetime"].astype(str)
+    elif "timestamp" in df.columns:
+        dt = df["timestamp"].astype(str)
+    elif "date" in df.columns and "time" in df.columns:
+        dt = (
+            df["date"].astype(str)
+            + " "
+            + df["time"].astype(str)
+        )
+    elif "date" in df.columns:
+        dt = df["date"].astype(str)
     else:
-        if raw_df.shape[1] >= 7:
-            dates = raw_df.iloc[:,0].astype(str) + ' ' + raw_df.iloc[:,1].astype(str)
-            values = raw_df.iloc[:,2:6].copy()
-        elif raw_df.shape[1] >= 5:
-            dates = raw_df.iloc[:,0].astype(str)
-            values = raw_df.iloc[:,1:5].copy()
-        else:
-            raise ValueError('Expected date and OHLC columns')
-        values.columns = ['open','high','low','close']
-    dt = pd.to_datetime(dates, format='mixed', errors='coerce')
-    if dt.isna().all():
-        dt = pd.to_datetime(dates, dayfirst=True, errors='coerce')
-    df = pd.DataFrame({c: pd.to_numeric(values[c], errors='coerce').to_numpy() for c in ['open','high','low','close']}, index=pd.DatetimeIndex(dt))
-    df = df.loc[~df.index.isna()].dropna().sort_index()
-    df = df[~df.index.duplicated(keep='last')]
-    df = df[(df.low > 0) & (df.high >= df[['open','close','low']].max(axis=1)) & (df.low <= df[['open','close','high']].min(axis=1))]
-    if df.empty:
-        raise ValueError('No valid OHLC rows')
-    return df
+        raise ValueError(
+            "Datetime column not found."
+        )
 
-def to_m15(df, source):
-    if source == 'M15':
-        return df
-    count = df['close'].resample('15min').count()
-    bars = df.resample('15min').agg({'open':'first','high':'max','low':'min','close':'last'})
-    return bars.loc[count == 15].dropna()
+    dates = pd.to_datetime(
+        dt, errors="coerce"
+    )
+
+    if dates.notna().mean() < 0.8:
+        dates = pd.to_datetime(
+            dt,
+            format="%Y.%m.%d %H:%M",
+            errors="coerce"
+        )
+
+    if dates.notna().mean() < 0.8:
+        dates = pd.to_datetime(
+            dt,
+            format="%Y%m%d %H%M%S",
+            errors="coerce"
+        )
+
+    df["datetime"] = dates
+
+    for c in ["open", "high", "low", "close"]:
+        df[c] = pd.to_numeric(
+            df[c], errors="coerce"
+        )
+
+    df = df.dropna(
+        subset=[
+            "datetime", "open",
+            "high", "low", "close"
+        ]
+    )
+
+    df = df[
+        (df["low"] > 0)
+        & (df["high"] >= df["low"])
+        & (
+            df["high"] >=
+            df[["open", "close"]].max(axis=1)
+        )
+        & (
+            df["low"] <=
+            df[["open", "close"]].min(axis=1)
+        )
+    ]
+
+    df = df.sort_values("datetime")
+    df = df.drop_duplicates("datetime")
+
+    return df.reset_index(drop=True)
+
+
+# =====================================
+# INDICATORS
+# =====================================
 
 def indicators(df):
     d = df.copy()
-    d['ema50'] = d.close.ewm(span=50, adjust=False).mean()
-    d['ema200'] = d.close.ewm(span=200, adjust=False).mean()
-    prev = d.close.shift(1)
-    tr = pd.concat([(d.high-d.low), (d.high-prev).abs(), (d.low-prev).abs()],axis=1).max(axis=1)
-    d['atr'] = tr.ewm(alpha=1/14,adjust=False).mean()
+
+    d["ema50"] = d["close"].ewm(
+        span=50, adjust=False
+    ).mean()
+
+    d["ema200"] = d["close"].ewm(
+        span=200, adjust=False
+    ).mean()
+
+    previous = d["close"].shift(1)
+
+    tr = pd.concat([
+        d["high"] - d["low"],
+        (d["high"] - previous).abs(),
+        (d["low"] - previous).abs()
+    ], axis=1).max(axis=1)
+
+    d["atr"] = tr.rolling(14).mean()
+
+    d["swing_high"] = (
+        d["high"].shift(1)
+        .rolling(40).max()
+    )
+
+    d["swing_low"] = (
+        d["low"].shift(1)
+        .rolling(40).min()
+    )
+
+    width = (
+        d["swing_high"] - d["swing_low"]
+    )
+
+    d["buy_low"] = (
+        d["swing_high"] - width * 0.65
+    )
+    d["buy_high"] = (
+        d["swing_high"] - width * 0.50
+    )
+
+    d["sell_low"] = (
+        d["swing_low"] + width * 0.50
+    )
+    d["sell_high"] = (
+        d["swing_low"] + width * 0.65
+    )
+
     return d
 
-def signal_at(d, i, lookback, rr, buffer):
-    if i < max(250,lookback+2):
-        return None
-    current = d.iloc[i]
-    prior = d.iloc[i-1]
-    window = d.iloc[i-lookback:i]
-    hi, lo = float(window.high.max()), float(window.low.min())
-    rng = hi-lo
-    atr = float(current.atr)
-    if rng <= 0 or atr <= 0 or not np.isfinite(atr):
-        return None
-    buy_lo, buy_hi = hi-0.618*rng, hi-0.5*rng
-    sell_lo, sell_hi = lo+0.5*rng, lo+0.618*rng
-    up = current.ema50 > current.ema200 and current.close > current.ema200
-    down = current.ema50 < current.ema200 and current.close < current.ema200
-    buy = up and current.low <= buy_hi and current.high >= buy_lo and current.close > current.open and current.close > prior.high
-    sell = down and current.high >= sell_lo and current.low <= sell_hi and current.close < current.open and current.close < prior.low
-    if buy:
-        sl = min(float(current.low),buy_lo)-buffer*atr
-        if sl < current.close:
-            return {'side':'BUY','sl':sl,'signal_close':float(current.close),'signal_time':d.index[i]}
-    if sell:
-        sl = max(float(current.high),sell_hi)+buffer*atr
-        if sl > current.close:
-            return {'side':'SELL','sl':sl,'signal_close':float(current.close),'signal_time':d.index[i]}
-    return None
 
-def backtest(d, lookback, rr, buffer, spread, slippage, fee, max_hold, dollars_per_unit):
-    records=[]
-    i=max(250,lookback+2)
-    while i < len(d)-1:
-        s=signal_at(d,i,lookback,rr,buffer)
-        if s is None:
-            i+=1
-            continue
-        side=s['side']
-        direction=1 if side=='BUY' else -1
-        next_bar=d.iloc[i+1]
-        entry=float(next_bar.open)+direction*(spread/2+slippage)
-        sl=s['sl']
-        risk=(entry-sl)*direction
-        if risk<=0:
-            i+=1
-            continue
-        tp=entry+direction*rr*risk
-        exit_price=None
-        reason='TIME'
-        last_j=min(len(d)-1,i+max_hold)
-        exit_j=last_j
-        for j in range(i+1,last_j+1):
-            b=d.iloc[j]
-            if side=='BUY':
-                hit_sl=b.low<=sl
-                hit_tp=b.high>=tp
-            else:
-                hit_sl=b.high>=sl
-                hit_tp=b.low<=tp
-            if hit_sl:
-                exit_price=sl-direction*(spread/2+slippage)
-                reason='SL (conservative if both hit)'
-            elif hit_tp:
-                exit_price=tp-direction*(spread/2+slippage)
-                reason='TP'
-            if exit_price is not None:
-                exit_j=j
-                break
-        if exit_price is None:
-            exit_price=float(d.iloc[exit_j].close)-direction*(spread/2+slippage)
-        pnl=direction*(exit_price-entry)*dollars_per_unit-fee
-        records.append({'signal_time':s['signal_time'],'entry_time':d.index[i+1], 'exit_time':d.index[exit_j], 'side':side, 'entry':entry, 'sl':sl, 'tp':tp, 'exit':exit_price, 'reason':reason, 'pnl_usd':pnl})
-        i=exit_j+1
-    return pd.DataFrame(records)
+# =====================================
+# SIGNAL ENGINE
+# =====================================
 
-st.sidebar.header('Settings')
-source=st.sidebar.selectbox('Input timeframe',['M15','M1'])
-lookback=st.sidebar.number_input('Swing lookback',20,200,60)
-rr=st.sidebar.slider('Reward / Risk',1.0,4.0,2.0,0.25)
-buffer=st.sidebar.slider('SL ATR buffer',0.0,2.0,0.3,0.1)
-spread=st.sidebar.number_input('Round-trip spread in XAUUSD price units',0.0,10.0,0.30,0.05)
-slippage=st.sidebar.number_input('Slippage per fill in price units',0.0,10.0,0.10,0.05)
-fee=st.sidebar.number_input('Commission per completed trade ($)',0.0,100.0,0.0,0.5)
-dollars_per_unit=st.sidebar.number_input('USD P/L per $1 gold move (position exposure)',0.01,10000.0,1.0,0.01)
-max_hold=st.sidebar.number_input('Max holding candles',1,500,32)
-balance=st.sidebar.number_input('Starting balance ($)',10.0,1000000.0,2500.0,10.0)
-st.sidebar.caption('Adjust cost and exposure assumptions to your broker. No position sizing automation.')
-files=st.file_uploader('Upload XAUUSD historical CSV/TXT/ZIP (one or more months)',type=['csv','txt','zip'],accept_multiple_files=True)
-if files:
-    try:
-        frames=[load_ohlc(f.getvalue(),f.name) for f in files]
-        raw=pd.concat(frames).sort_index()
-        raw=raw[~raw.index.duplicated(keep='last')]
-        d=to_m15(raw,source)
-        # Conservatively exclude last bar, which could be incomplete.
-        d=d.iloc[:-1]
-        if len(d)<260:
-            st.error('Need at least 260 completed M15 candles')
-            st.stop()
-        d=indicators(d)
-        st.success(f'{len(d):,} completed M15 candles loaded')
-        st.caption(f'Data range: {d.index.min()} to {d.index.max()} (timestamps as supplied)')
-        current=signal_at(d,len(d)-1,int(lookback),float(rr),float(buffer))
-        st.subheader('Latest historical signal')
-        if current:
-            st.success(f"{current['side']} — confirmation at {current['signal_time']}") if current['side']=='BUY' else st.error(f"{current['side']} — confirmation at {current['signal_time']}")
-            st.write('Reference signal close:',round(current['signal_close'],2),'| Proposed SL:',round(current['sl'],2))
-            st.caption('Actual entry would require the next completed candle/open; no future fill assumed here.')
+def signal_engine(d, i):
+    if i < 200:
+        return "WAIT", "Insufficient history"
+
+    r = d.iloc[i]
+    p = d.iloc[i - 1]
+
+    if pd.isna(r["atr"]) or r["atr"] <= 0:
+        return "WAIT", "ATR unavailable"
+
+    bullish = (
+        r["ema50"] > r["ema200"]
+        and r["close"] > r["ema50"]
+        and r["ema50"] > p["ema50"]
+    )
+
+    bearish = (
+        r["ema50"] < r["ema200"]
+        and r["close"] < r["ema50"]
+        and r["ema50"] < p["ema50"]
+    )
+
+    buy_zone = (
+        r["low"] <= r["buy_high"]
+        and r["high"] >= r["buy_low"]
+    )
+
+    sell_zone = (
+        r["high"] >= r["sell_low"]
+        and r["low"] <= r["sell_high"]
+    )
+
+    buy_candle = (
+        r["close"] > r["open"]
+        and r["close"] > p["close"]
+    )
+
+    sell_candle = (
+        r["close"] < r["open"]
+        and r["close"] < p["close"]
+    )
+
+    if bullish and buy_zone and buy_candle:
+        return (
+            "BUY",
+            "EMA uptrend + Golden Zone + confirmation"
+        )
+
+    if bearish and sell_zone and sell_candle:
+        return (
+            "SELL",
+            "EMA downtrend + Golden Zone + confirmation"
+        )
+
+    return "WAIT", "No confirmed setup"
+
+
+# =====================================
+# TRADE SIMULATION
+# =====================================
+
+def run_backtest(d, start, end):
+    trades = []
+    equity = float(balance)
+    daily_pnl = {}
+    daily_count = {}
+    i = max(200, start)
+
+    while i < min(end - 1, len(d) - 1):
+        sig, reason = signal_engine(d, i)
+
+        if sig == "WAIT":
+            i += 1
+            continue
+
+        entry_i = i + 1
+        er = d.iloc[entry_i]
+        day = str(er["datetime"].date())
+
+        day_pnl = daily_pnl.get(day, 0.0)
+        count = daily_count.get(day, 0)
+
+        if count >= max_trades:
+            i += 1
+            continue
+
+        remaining = daily_limit + min(
+            day_pnl, 0.0
+        )
+
+        if remaining <= 0:
+            i += 1
+            continue
+
+        atr = float(d.iloc[i]["atr"])
+        distance = atr * 1.5
+
+        if distance <= 0:
+            i += 1
+            continue
+
+        half_spread = spread / 2
+
+        if sig == "BUY":
+            entry = (
+                float(er["open"])
+                + half_spread + slippage
+            )
+            stop = entry - distance
+            target = entry + distance * rr
         else:
-            st.warning('WAIT — no fully confirmed setup')
-        st.subheader('Historical backtest')
-        if st.button('Run V30 Backtest',type='primary'):
-            trades=backtest(d,int(lookback),float(rr),float(buffer),float(spread),float(slippage),float(fee),int(max_hold),float(dollars_per_unit))
-            if trades.empty:
-                st.info('No completed trades with these settings.')
+            entry = (
+                float(er["open"])
+                - half_spread - slippage
+            )
+            stop = entry + distance
+            target = entry - distance * rr
+
+        risk_budget = min(
+            equity * risk_pct / 100,
+            remaining * 0.80
+        )
+
+        # Conservative loss includes exit costs.
+        cost_per_lot = (
+            (distance + spread / 2 + slippage)
+            * contract_size + commission
+        )
+
+        raw_lots = risk_budget / cost_per_lot
+
+        lots = (
+            math.floor(
+                raw_lots / lot_step + 1e-9
+            ) * lot_step
+        )
+
+        lots = min(
+            lots,
+            math.floor(max_lots / lot_step)
+            * lot_step
+        )
+
+        if lots < lot_step:
+            i += 1
+            continue
+
+        exit_price = None
+        exit_i = None
+        outcome = "TIME"
+
+        last_j = min(
+            entry_i + max_hold - 1,
+            end - 1,
+            len(d) - 1
+        )
+
+        for j in range(entry_i, last_j + 1):
+            bar = d.iloc[j]
+
+            if sig == "BUY":
+                hit_sl = bar["low"] <= stop
+                hit_tp = bar["high"] >= target
             else:
-                pnl=trades.pnl_usd
-                equity=balance+pnl.cumsum()
-                peaks=pd.concat([pd.Series([balance]),equity.reset_index(drop=True)]).cummax().iloc[1:].to_numpy()
-                drawdown=(equity.to_numpy()-peaks)
-                gains=pnl[pnl>0].sum()
-                losses=-pnl[pnl<0].sum()
-                pf=gains/losses if losses>0 else float('inf') if gains>0 else 0
-                a,b,c,dcol=st.columns(4)
-                a.metric('Trades',len(trades))
-                b.metric('Win rate',f'{(pnl>0).mean()*100:.1f}%')
-                c.metric('Net P/L',f'${pnl.sum():,.2f}')
-                dcol.metric('Profit factor',f'{pf:.2f}')
-                st.metric('Max dollar drawdown',f'${abs(min(0,float(drawdown.min()))):,.2f}')
-                st.metric('Ending balance',f'${balance+pnl.sum():,.2f}')
-                st.line_chart(pd.DataFrame({'Equity':equity.to_numpy()},index=trades.exit_time))
-                st.dataframe(trades,use_container_width=True)
-                st.download_button('Download V30 trades CSV',trades.to_csv(index=False).encode('utf-8'),'Tuesday_AI_V30_trades.csv','text/csv')
-                st.warning('Backtest assumptions: one position at a time, no compounding, no margin model. Both SL and TP in one candle count as SL. Intrabar gaps and execution may differ. Costs are estimates; no independent out-of-sample validation yet.')
-    except Exception as exc:
-        st.error(f'Data processing error: {exc}')
+                hit_sl = bar["high"] >= stop
+                hit_tp = bar["low"] <= target
+
+            # Conservative if both touched.
+            if hit_sl:
+                exit_price = stop
+                exit_i = j
+                outcome = "SL"
+                break
+
+            if hit_tp:
+                exit_price = target
+                exit_i = j
+                outcome = "TP"
+                break
+
+        if exit_price is None:
+            exit_i = last_j
+            exit_price = float(
+                d.iloc[exit_i]["close"]
+            )
+
+        if sig == "BUY":
+            effective_exit = (
+                exit_price - half_spread - slippage
+            )
+            gross = (
+                effective_exit - entry
+            ) * contract_size * lots
+        else:
+            effective_exit = (
+                exit_price + half_spread + slippage
+            )
+            gross = (
+                entry - effective_exit
+            ) * contract_size * lots
+
+        net = gross - commission * lots
+
+        equity += net
+
+        daily_pnl[day] = (
+            daily_pnl.get(day, 0.0) + net
+        )
+
+        daily_count[day] = (
+            daily_count.get(day, 0) + 1
+        )
+
+        trades.append({
+            "signal_time": d.iloc[i]["datetime"],
+            "entry_time": er["datetime"],
+            "exit_time": d.iloc[exit_i]["datetime"],
+            "side": sig,
+            "entry": round(entry, 3),
+            "stop": round(stop, 3),
+            "target": round(target, 3),
+            "exit": round(effective_exit, 3),
+            "lots": round(lots, 4),
+            "outcome": outcome,
+            "net_pnl": round(net, 2),
+            "equity": round(equity, 2),
+            "reason": reason
+        })
+
+        # Only one position at a time.
+        i = exit_i + 1
+
+    return pd.DataFrame(trades)
+
+
+# =====================================
+# PERFORMANCE REPORT
+# =====================================
+
+def report(trades, name):
+    st.subheader(name)
+
+    if trades.empty:
+        st.info("No trades found for this period.")
+        return
+
+    wins = trades[trades["net_pnl"] > 0]
+    losses = trades[trades["net_pnl"] < 0]
+
+    total = len(trades)
+    win_rate = len(wins) / total * 100
+    net = trades["net_pnl"].sum()
+
+    gross_profit = wins["net_pnl"].sum()
+    gross_loss = abs(losses["net_pnl"].sum())
+
+    pf = (
+        gross_profit / gross_loss
+        if gross_loss > 0
+        else float("inf")
+    )
+
+    curve = pd.concat([
+        pd.Series([balance]),
+        trades["equity"].reset_index(drop=True)
+    ], ignore_index=True)
+
+    peak = curve.cummax()
+    drawdown = peak - curve
+
+    max_dd = drawdown.max()
+
+    c1, c2, c3 = st.columns(3)
+
+    c1.metric("Trades", total)
+    c2.metric("Win Rate", f"{win_rate:.1f}%")
+    c3.metric("Net P&L", f"${net:.2f}")
+
+    c4, c5, c6 = st.columns(3)
+
+    c4.metric("Profit Factor", f"{pf:.2f}")
+    c5.metric("Max Drawdown", f"${max_dd:.2f}")
+    c6.metric(
+        "Final Equity",
+        f"${balance + net:.2f}"
+    )
+
+    st.line_chart(
+        curve.reset_index(drop=True)
+    )
+
+    st.dataframe(
+        trades, use_container_width=True
+    )
+
+    csv = trades.to_csv(index=False)
+
+    st.download_button(
+        f"⬇️ Download {name} CSV",
+        data=csv,
+        file_name=(
+            name.replace(" ", "_") + ".csv"
+        ),
+        mime="text/csv"
+    )
+
+    if net <= 0 or pf < 1.2:
+        st.error(
+            "Validation failed: not suitable "
+            "for live funded trading."
+        )
+    else:
+        st.warning(
+            "Positive historical results do not "
+            "prove future profitability. "
+            "Further demo validation required."
+        )
+
+
+# =====================================
+# APP UI
+# =====================================
+
+st.header("📂 Upload XAUUSD M15 CSV")
+
+uploaded = st.file_uploader(
+    "Upload historical OHLC CSV",
+    type=["csv", "txt"]
+)
+
+if uploaded is not None:
+    try:
+        df = load_csv(uploaded)
+
+        if len(df) < 250:
+            st.error(
+                "At least 250 candles required."
+            )
+            st.stop()
+
+        d = indicators(df)
+
+        st.success(
+            f"Loaded {len(d):,} candles"
+        )
+
+        st.write(
+            "Period:",
+            str(d["datetime"].min()),
+            "to",
+            str(d["datetime"].max())
+        )
+
+        st.line_chart(
+            d.set_index("datetime")[
+                ["close", "ema50", "ema200"]
+            ].tail(300)
+        )
+
+        st.header("🚦 Latest Signal")
+
+        latest = len(d) - 1
+        sig, reason = signal_engine(d, latest)
+
+        if sig == "BUY":
+            st.success("🟢 BUY SETUP")
+        elif sig == "SELL":
+            st.error("🔴 SELL SETUP")
+        else:
+            st.warning("🟡 WAIT")
+
+        st.write("Reason:", reason)
+        st.caption(
+            "Signal uses the latest uploaded candle. "
+            "Only use completed M15 candles. "
+            "This is not a live market signal."
+        )
+
+        st.header("📊 Independent Backtest")
+
+        st.info(
+            "Rules are fixed. September is the "
+            "development period; October is the "
+            "held-out test period. Do not tune "
+            "parameters using October results."
+        )
+
+        months = d["datetime"].dt.to_period("M")
+
+        train_mask = (
+            months.astype(str) == "2026-09"
+        )
+        test_mask = (
+            months.astype(str) == "2026-10"
+        )
+
+        if train_mask.any() and test_mask.any():
+            train_indices = np.where(
+                train_mask.to_numpy()
+            )[0]
+
+            test_indices = np.where(
+                test_mask.to_numpy()
+            )[0]
+
+            train = run_backtest(
+                d,
+                int(train_indices[0]),
+                int(train_indices[-1]) + 1
+            )
+
+            test = run_backtest(
+                d,
+                int(test_indices[0]),
+                int(test_indices[-1]) + 1
+            )
+
+            report(
+                train,
+                "September 2026 Development"
+            )
+
+            report(
+                test,
+                "October 2026 Independent Test"
+            )
+
+        else:
+            st.warning(
+                "For independent validation, "
+                "upload one CSV containing both "
+                "September and October 2026 M15 data."
+            )
+
+            if st.button("Run full-period backtest"):
+                trades = run_backtest(
+                    d, 200, len(d)
+                )
+
+                report(
+                    trades,
+                    "Full Period Backtest"
+                )
+
+    except Exception as e:
+        st.error(f"CSV processing error: {e}")
+
 else:
-    st.info('Upload historical data to analyze signals and run the backtest.')
+    st.info(
+        "Upload XAUUSD M15 historical CSV "
+        "to begin analysis."
+    )
+
+st.divider()
+
+st.caption(
+    "Tuesday AI V31 | Manual research assistant | "
+    "No automatic orders"
+)
