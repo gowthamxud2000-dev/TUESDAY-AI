@@ -2,253 +2,423 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import io
-import zipfile
+from io import BytesIO
 
-st.set_page_config(page_title="Tuesday AI V36", layout="wide")
-st.title("Tuesday AI V36")
-st.caption("XAUUSD M15 | Risk-Safe Independent Backtest")
-
-st.warning("Research only. No automatic trading or guaranteed profits.")
-
-balance = st.number_input("Starting balance ($)", 1.0, value=100.0)
-risk_pct = st.number_input("Risk per trade (%)", 0.1, 5.0, 1.0)
-daily_limit = st.number_input("Daily loss limit ($)", 0.1, value=3.0)
-min_lot = st.number_input("Minimum lot", 0.01, value=0.01)
-contract = st.number_input("Ounces per 1 lot", 1.0, value=100.0)
-spread = st.number_input("Spread in gold price units", 0.0, value=0.30)
-slippage = st.number_input("Slippage per side", 0.0, value=0.10)
-commission = st.number_input("Round-trip commission per lot ($)", 0.0, value=7.0)
-
-st.caption("Check lot contract size, spread and commission with your broker.")
-
-files = st.file_uploader(
-    "Upload September and October M1 ZIP or M15 CSV",
-    type=["csv", "txt", "zip"],
-    accept_multiple_files=True
+st.set_page_config(
+    page_title="Tuesday AI V37",
+    page_icon="📈",
+    layout="wide"
 )
 
-def load_one(name, data):
-    if name.lower().endswith(".zip"):
-        with zipfile.ZipFile(io.BytesIO(data)) as z:
-            frames = []
-            for item in z.namelist():
-                if item.lower().endswith((".csv", ".txt")):
-                    frames.append(load_one(item, z.read(item)))
-            return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+st.title("Tuesday AI V37 — XAUUSD M1 Scalping")
+st.caption("Experimental backtest assistant. Manual trading only.")
 
-    raw = pd.read_csv(
-        io.BytesIO(data), sep=None, engine="python",
-        header=None, on_bad_lines="skip"
+with st.sidebar:
+    balance = st.number_input(
+        "Starting balance ($)", min_value=1.0, value=100.0
+    )
+    risk_pct = st.number_input(
+        "Risk per trade (%)", 0.1, 5.0, 1.0, 0.1
+    )
+    min_lot = st.number_input(
+        "Minimum lot", min_value=0.001,
+        value=0.01, format="%.3f"
+    )
+    contract = st.number_input(
+        "Ounces per lot (check broker)",
+        min_value=1.0, value=100.0
+    )
+    spread = st.number_input(
+        "Spread (price units)",
+        min_value=0.0, value=0.30
+    )
+    slippage = st.number_input(
+        "Slippage per side",
+        min_value=0.0, value=0.10
+    )
+    commission = st.number_input(
+        "Round-trip commission per lot ($)",
+        min_value=0.0, value=7.0
+    )
+    rr = st.number_input(
+        "Reward/Risk", min_value=1.0, value=1.5
+    )
+    max_daily_loss = st.number_input(
+        "Daily loss cap ($)", min_value=0.1, value=3.0
+    )
+    max_trades = st.number_input(
+        "Max trades per day", min_value=1, value=3
     )
 
-    if raw.empty:
-        return pd.DataFrame()
+st.info("Upload XAUUSD M1 CSV. M5 and M15 will be generated automatically.")
 
-    first = str(raw.iloc[0, 0]).lower()
-    if first in ["date", "datetime", "time", "timestamp"]:
-        raw = raw.iloc[1:].reset_index(drop=True)
+upload = st.file_uploader(
+    "Upload M1 CSV", type=["csv", "txt"]
+)
 
-    if raw.shape[1] >= 7:
-        raw = raw.iloc[:, :7]
-        raw.columns = ["date", "clock", "open", "high", "low", "close", "volume"]
-        raw["time"] = pd.to_datetime(
-            raw["date"].astype(str) + " " + raw["clock"].astype(str),
-            errors="coerce"
-        )
-    elif raw.shape[1] >= 5:
-        raw = raw.iloc[:, :min(raw.shape[1], 6)]
-        raw.columns = ["time", "open", "high", "low", "close"] + (
-            ["volume"] if raw.shape[1] == 6 else []
-        )
-        raw["time"] = pd.to_datetime(raw["time"], errors="coerce")
-    else:
-        raise ValueError("CSV needs time, open, high, low, close columns.")
+def load_data(file):
+    raw = file.getvalue()
+    df = None
+
+    for sep in [",", ";", "\t"]:
+        try:
+            temp = pd.read_csv(BytesIO(raw), sep=sep)
+            cols = {
+                str(c).lower().strip(): c
+                for c in temp.columns
+            }
+
+            if all(
+                k in cols
+                for k in ["open", "high", "low", "close"]
+            ):
+                df = temp.rename(
+                    columns={
+                        cols[k]: k
+                        for k in ["open", "high", "low", "close"]
+                    }
+                )
+
+                if "datetime" in cols:
+                    dates = df[cols["datetime"]]
+                elif "timestamp" in cols:
+                    dates = df[cols["timestamp"]]
+                elif "date" in cols:
+                    dates = df[cols["date"]].astype(str)
+                    if "time" in cols:
+                        dates += " " + df[cols["time"]].astype(str)
+                else:
+                    raise ValueError("Date/Time missing")
+
+                df["dt"] = pd.to_datetime(
+                    dates, errors="coerce"
+                )
+                break
+        except Exception:
+            pass
+
+    if df is None:
+        for sep in [";", ","]:
+            try:
+                temp = pd.read_csv(
+                    BytesIO(raw), sep=sep, header=None
+                )
+                if temp.shape[1] >= 5:
+                    df = temp.iloc[:, :5].copy()
+                    df.columns = [
+                        "dt", "open", "high", "low", "close"
+                    ]
+                    df["dt"] = pd.to_datetime(
+                        df["dt"].astype(str).str.strip(),
+                        format="%Y%m%d %H%M%S",
+                        errors="coerce"
+                    )
+                    if df["dt"].notna().sum() > 10:
+                        break
+            except Exception:
+                pass
+
+    if df is None:
+        raise ValueError("CSV format not recognized")
 
     for c in ["open", "high", "low", "close"]:
-        raw[c] = pd.to_numeric(raw[c], errors="coerce")
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    return raw.dropna(subset=["time", "open", "high", "low", "close"])
+    df = (
+        df.dropna()
+        .drop_duplicates("dt")
+        .sort_values("dt")
+        .set_index("dt")
+    )
 
-def prepare(files):
-    frames = [load_one(f.name, f.getvalue()) for f in files]
-    df = pd.concat(frames, ignore_index=True)
-    df = df.drop_duplicates("time").sort_values("time").set_index("time")
+    if len(df) < 500:
+        raise ValueError("Minimum 500 M1 candles needed")
 
-    df = df[["open", "high", "low", "close"]].resample("15min").agg({
-        "open": "first", "high": "max",
-        "low": "min", "close": "last"
+    return df
+
+
+def resample(df, rule):
+    return df.resample(rule).agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last"
     }).dropna()
 
-    df["ema50"] = df.close.ewm(span=50, adjust=False).mean()
-    df["ema200"] = df.close.ewm(span=200, adjust=False).mean()
 
-    prev = df.close.shift(1)
-    tr = pd.concat([
-        df.high - df.low,
-        (df.high - prev).abs(),
-        (df.low - prev).abs()
-    ], axis=1).max(axis=1)
+def signals(m1):
+    m5 = resample(m1, "5min")
+    m15 = resample(m1, "15min")
 
-    df["atr"] = tr.rolling(14).mean()
-    df["swing_low"] = df.low.shift(1).rolling(10).min()
-    df["swing_high"] = df.high.shift(1).rolling(10).max()
-    return df.dropna()
+    m15["ema50"] = m15.close.ewm(
+        span=50, adjust=False
+    ).mean()
+    m15["ema200"] = m15.close.ewm(
+        span=200, adjust=False
+    ).mean()
 
-def backtest(df):
-    equity = balance
+    m15["trend"] = np.where(
+        m15.ema50 > m15.ema200, 1, -1
+    )
+
+    m5["prior_high"] = (
+        m5.high.shift(1).rolling(10).max()
+    )
+    m5["prior_low"] = (
+        m5.low.shift(1).rolling(10).min()
+    )
+
+    m5["bos"] = np.select(
+        [
+            m5.close > m5.prior_high,
+            m5.close < m5.prior_low
+        ],
+        [1, -1],
+        default=0
+    )
+
+    trend = m15["trend"].shift(1).reindex(
+        m1.index, method="ffill"
+    )
+    bos = m5["bos"].shift(1).reindex(
+        m1.index, method="ffill"
+    )
+
+    prev_low = m1.low.shift(1).rolling(10).min()
+    prev_high = m1.high.shift(1).rolling(10).max()
+
+    buy = (
+        (trend == 1) &
+        (bos == 1) &
+        (m1.low < prev_low) &
+        (m1.close > prev_low) &
+        (m1.close > m1.open)
+    )
+
+    sell = (
+        (trend == -1) &
+        (bos == -1) &
+        (m1.high > prev_high) &
+        (m1.close < prev_high) &
+        (m1.close < m1.open)
+    )
+
+    out = m1.copy()
+    out["signal"] = np.select(
+        [buy, sell], [1, -1], default=0
+    )
+    return out
+
+
+def backtest(data):
     trades = []
     rejected = []
-    daily_loss = {}
-    i = 1
+    equity = balance
+    current_day = None
+    day_start = balance
+    count = 0
+    i = 220
 
-    while i < len(df) - 1:
-        r = df.iloc[i]
-        p = df.iloc[i - 1]
-        t = df.index[i]
+    while i < len(data) - 1:
+        candle = data.iloc[i]
+        ts = data.index[i]
 
-        side = None
-        if r.ema50 > r.ema200 and p.close <= p.ema50 and r.close > r.ema50:
-            side = "BUY"
-        elif r.ema50 < r.ema200 and p.close >= p.ema50 and r.close < r.ema50:
-            side = "SELL"
+        if current_day != ts.date():
+            current_day = ts.date()
+            day_start = equity
+            count = 0
 
-        if side is None:
+        side = int(candle.signal)
+
+        if side == 0:
             i += 1
             continue
 
-        entry = float(df.iloc[i + 1].open)
-        stop = float(r.swing_low if side == "BUY" else r.swing_high)
-
-        if (side == "BUY" and stop >= entry) or (
-            side == "SELL" and stop <= entry
-        ):
-            rejected.append([t, side, "Invalid stop", 0])
+        if count >= max_trades or day_start - equity >= max_daily_loss:
+            rejected.append((ts, "Daily limit"))
             i += 1
             continue
 
-        distance = abs(entry - stop)
-        target = entry + 2 * distance if side == "BUY" else entry - 2 * distance
+        entry_raw = float(data.iloc[i + 1].open)
 
-        max_risk = min(equity * risk_pct / 100, balance * risk_pct / 100)
-        estimated_risk = (
-            (distance + spread + 2 * slippage) * contract * min_lot
+        stop = (
+            float(candle.low - 0.10)
+            if side == 1
+            else float(candle.high + 0.10)
+        )
+
+        entry = entry_raw + side * (
+            spread / 2 + slippage
+        )
+        stop_fill = stop - side * (
+            spread / 2 + slippage
+        )
+
+        risk_price = (entry - stop_fill) * side
+
+        if risk_price <= 0:
+            rejected.append((ts, "Invalid stop"))
+            i += 1
+            continue
+
+        risk_dollars = (
+            risk_price * contract * min_lot
             + commission * min_lot
         )
 
-        if estimated_risk > max_risk:
-            rejected.append([t, side, "Minimum lot risk too high", estimated_risk])
+        remaining_daily = max_daily_loss - (
+            day_start - equity
+        )
+
+        if risk_dollars > min(
+            equity * risk_pct / 100,
+            remaining_daily
+        ):
+            rejected.append((ts, "Risk exceeds limit"))
             i += 1
             continue
 
-        day = str(t.date())
-        if daily_loss.get(day, 0) >= daily_limit:
-            rejected.append([t, side, "Daily loss limit", estimated_risk])
-            i += 1
-            continue
+        target = entry + side * rr * risk_price
 
+        exit_index = None
         exit_price = None
-        exit_time = None
         outcome = None
-        j = i + 1
 
-        while j < len(df):
-            candle = df.iloc[j]
-            if side == "BUY":
-                hit_sl = candle.low <= stop
-                hit_tp = candle.high >= target
+        for j in range(i + 1, len(data)):
+            bar = data.iloc[j]
+
+            if side == 1:
+                hit_sl = bar.low <= stop
+                hit_tp = bar.high >= target + spread / 2
             else:
-                hit_sl = candle.high >= stop
-                hit_tp = candle.low <= target
+                hit_sl = bar.high >= stop
+                hit_tp = bar.low <= target - spread / 2
 
             if hit_sl or hit_tp:
-                # Conservative: stop wins if both touched.
-                exit_price = stop if hit_sl else target
-                exit_time = df.index[j]
                 outcome = "SL" if hit_sl else "TP"
+                exit_index = j
+                exit_price = (
+                    stop_fill
+                    if hit_sl
+                    else target - side * (
+                        spread / 2 + slippage
+                    )
+                )
                 break
-            j += 1
 
-        if exit_price is None:
-            exit_price = float(df.iloc[-1].close)
-            exit_time = df.index[-1]
+        if exit_index is None:
+            exit_index = len(data) - 1
             outcome = "END"
-            j = len(df) - 1
+            exit_price = (
+                float(data.iloc[-1].close)
+                - side * (spread / 2 + slippage)
+            )
 
-        direction = 1 if side == "BUY" else -1
-        gross = (exit_price - entry) * direction * contract * min_lot
-        costs = (spread + 2 * slippage) * contract * min_lot + commission * min_lot
-        pnl = gross - costs
+        pnl = (
+            (exit_price - entry)
+            * side * contract * min_lot
+            - commission * min_lot
+        )
 
         equity += pnl
-        if pnl < 0:
-            daily_loss[day] = daily_loss.get(day, 0) + abs(pnl)
+        count += 1
 
-        trades.append([
-            t, exit_time, side, entry, stop, target,
-            outcome, round(pnl, 2), round(equity, 2)
-        ])
+        trades.append({
+            "time": ts,
+            "side": "BUY" if side == 1 else "SELL",
+            "entry": round(entry, 3),
+            "stop": round(stop, 3),
+            "target": round(target, 3),
+            "exit_time": data.index[exit_index],
+            "exit_reason": outcome,
+            "pnl": round(pnl, 2),
+            "equity": round(equity, 2)
+        })
 
-        if equity <= 0:
-            break
-        i = j + 1
-
-    trade_cols = [
-        "entry_time", "exit_time", "side", "entry",
-        "sl", "tp", "result", "pnl", "equity"
-    ]
-    reject_cols = ["time", "side", "reason", "estimated_risk"]
+        i = exit_index + 1
 
     return (
-        pd.DataFrame(trades, columns=trade_cols),
-        pd.DataFrame(rejected, columns=reject_cols)
+        pd.DataFrame(trades),
+        pd.DataFrame(rejected, columns=["time", "reason"])
     )
 
-if files:
+
+if upload:
     try:
-        df = prepare(files)
-        st.success(f"Loaded {len(df)} M15 candles")
-        st.write("Period:", df.index.min(), "to", df.index.max())
+        df = load_data(upload)
+        st.write(f"M1 candles: {len(df):,}")
 
-        if st.button("Run V36 Independent Backtest"):
-            if len(df) < 250:
-                st.error("Not enough data.")
-            else:
-                trades, rejected = backtest(df)
+        gaps = (
+            df.index.to_series().diff()
+            > pd.Timedelta(minutes=1)
+        ).sum()
 
-                st.subheader("Results")
-                a, b, c = st.columns(3)
-                a.metric("Trades", len(trades))
-                b.metric("Rejected", len(rejected))
-                c.metric(
-                    "Net P&L",
-                    f"${trades.pnl.sum():.2f}" if len(trades) else "$0.00"
-                )
+        if gaps:
+            st.warning(
+                f"{gaps} gaps detected. Check data quality."
+            )
 
-                if len(trades):
-                    st.metric("Win rate", f"{(trades.pnl > 0).mean()*100:.1f}%")
-                    st.line_chart(trades.set_index("exit_time")["equity"])
-                    st.dataframe(trades)
-                    st.download_button(
-                        "Download V36 Trades CSV",
-                        trades.to_csv(index=False),
-                        "V36_trades.csv",
-                        "text/csv"
-                    )
+        data = signals(df)
+        latest = data.iloc[-2]
 
-                if len(rejected):
-                    st.dataframe(rejected)
-                    st.download_button(
-                        "Download V36 Rejected CSV",
-                        rejected.to_csv(index=False),
-                        "V36_rejected.csv",
-                        "text/csv"
-                    )
+        signal = {
+            1: "🟢 BUY Setup",
+            -1: "🔴 SELL Setup",
+            0: "🟡 WAIT"
+        }[int(latest.signal)]
 
-                if not len(trades):
-                    st.warning("WAIT: No risk-safe trades found.")
+        st.subheader(signal)
+        st.caption("Historical signal, not live market data.")
+
+        trades, rejected = backtest(data)
+
+        if len(trades):
+            st.metric("Trades", len(trades))
+            st.metric(
+                "Net P/L",
+                f"${trades.pnl.sum():.2f}"
+            )
+            st.metric(
+                "Win Rate",
+                f"{(trades.pnl > 0).mean() * 100:.1f}%"
+            )
+            st.metric(
+                "Ending Balance",
+                f"${trades.equity.iloc[-1]:.2f}"
+            )
+
+            st.line_chart(
+                trades.set_index("exit_time").equity
+            )
+            st.dataframe(trades)
+
+            st.download_button(
+                "Download V37 Trades",
+                trades.to_csv(index=False),
+                "V37_trades.csv",
+                "text/csv"
+            )
+        else:
+            st.warning("No trades passed risk rules. WAIT.")
+
+        st.write("Rejected setups:", len(rejected))
+
+        if len(rejected):
+            st.dataframe(rejected.reason.value_counts())
+            st.download_button(
+                "Download V37 Rejected",
+                rejected.to_csv(index=False),
+                "V37_rejected.csv",
+                "text/csv"
+            )
+
+        st.warning(
+            "Experimental strategy. M1 OHLC backtesting "
+            "cannot reproduce real tick execution. "
+            "Validate on unseen data before demo trading."
+        )
 
     except Exception as e:
-        st.error(f"Data error: {e}")
+        st.error(f"CSV error: {e}")
 else:
-    st.info("Upload historical data to begin.")
+    st.write("Upload XAUUSD M1 CSV to start.")
