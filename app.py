@@ -4,7 +4,14 @@ import streamlit as st
 
 st.set_page_config(page_title="Tuesday AI V43", layout="wide")
 st.title("Tuesday AI V43 | Trend Pullback Lab")
-st.warning("Synthetic demo only. No live prices, orders, or guaranteed profits.")
+st.caption("Historical CSV or synthetic demo. No live prices or orders.")
+source = st.radio("Data source", ["Historical CSV", "Synthetic demo"])
+upload = None
+if source == "Historical CSV":
+    upload = st.file_uploader("Upload XAUUSD M1 CSV", type=["csv"])
+    st.caption("Columns: datetime (or time), open, high, low, close. "
+               "Timestamps must be M1 candle opening times. "
+               "Source timezone is preserved; daily limits use those dates.")
 
 with st.sidebar:
     seed = st.number_input("Random seed", 1, 999999, 43)
@@ -37,11 +44,47 @@ def make_data(seed, days):
     })
 
 
+def load_csv(uploaded):
+    raw = pd.read_csv(uploaded)
+    raw.columns = raw.columns.str.strip().str.lower()
+    if "time" not in raw.columns and "datetime" in raw.columns:
+        raw = raw.rename(columns={"datetime": "time"})
+    needed = ["time", "open", "high", "low", "close"]
+    missing = [c for c in needed if c not in raw.columns]
+    if missing:
+        raise ValueError("Missing columns: " + ", ".join(missing))
+    d = raw[needed].copy()
+    d["time"] = pd.to_datetime(d["time"], errors="coerce")
+    if d.time.isna().any():
+        raise ValueError("Invalid or missing timestamps.")
+    if not pd.api.types.is_datetime64_any_dtype(d.time):
+        raise ValueError("Use one consistent timestamp format and timezone.")
+    if (d.time.dt.second.ne(0) | d.time.dt.microsecond.ne(0)
+            | d.time.dt.nanosecond.ne(0)).any():
+        raise ValueError("Expected minute-aligned M1 candle opening times.")
+    if d.time.duplicated().any():
+        raise ValueError("Duplicate timestamps found. Use the prepared combined CSV.")
+    for c in needed[1:]:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    if not np.isfinite(d[needed[1:]].to_numpy()).all():
+        raise ValueError("OHLC values must be finite numbers.")
+    bad = ((d.low <= 0) | (d.low > d[["open", "close"]].min(axis=1))
+           | (d.high < d[["open", "close"]].max(axis=1)))
+    if bad.any():
+        raise ValueError("Invalid OHLC candle values.")
+    d = d.sort_values("time").reset_index(drop=True)
+    if len(d) < 2000:
+        raise ValueError("At least 2,000 M1 candles are required.")
+    # Missing minutes stay missing; never invent candles.
+    return d
+
+
 def prepare(raw):
     d = raw.copy().reset_index(drop=True)
     m = d.set_index("time").resample(
         "5min", closed="left", label="right"
-    ).agg({"close": "last"}).dropna()
+    ).agg(close=("close", "last"), count=("close", "count"))
+    m = m.loc[m["count"] == 5].copy()
 
     m["fast"] = m.close.ewm(span=50, adjust=False).mean()
     m["slow"] = m.close.ewm(span=200, adjust=False).mean()
@@ -120,6 +163,10 @@ def test(d, start, end):
             continue
 
         k = i + 1
+        # Do not carry a pre-gap signal into a later session.
+        if d.at[k, "time"] - d.at[i, "time"] != pd.Timedelta(minutes=1):
+            i += 1
+            continue
         day = d.at[k, "time"].date()
         day_open.setdefault(day, equity)
         remaining = daily_cap - max(0, day_open[day] - equity)
@@ -234,23 +281,38 @@ def report(title, trades):
         st.dataframe(trades, use_container_width=True)
 
 
-if st.button("Run V43 Demo Backtest", type="primary"):
-    d = prepare(make_data(seed, days))
+if st.button("Run Backtest", type="primary"):
+    if source == "Historical CSV" and upload is None:
+        st.info("Select your downloaded M1 CSV above first.")
+        st.stop()
+    try:
+        raw = load_csv(upload) if source == "Historical CSV" else make_data(seed, days)
+    except (ValueError, TypeError, pd.errors.ParserError, UnicodeDecodeError) as exc:
+        st.error(f"CSV could not be loaded: {exc}")
+        st.stop()
+    d = prepare(raw)
     split = int(len(d) * 0.7)
-    st.success(f"{len(d):,} synthetic M1 candles generated")
+    st.success(f"{len(d):,} {source} M1 candles loaded")
+    st.write("Data range:", str(raw.time.iloc[0]), "to", str(raw.time.iloc[-1]))
+    gaps = int(raw.time.diff().gt(pd.Timedelta(minutes=1)).sum())
+    st.write("Gaps longer than one minute (not filled):", gaps)
+    st.write("Development ends:", str(d.time.iloc[split - 1]))
+    st.write("Holdout starts:", str(d.time.iloc[split]))
     report("Development 70%", test(d, 0, split))
     report("Holdout 30%", test(d, split, len(d)))
-
+    st.caption("Each segment starts with the selected balance. "
+               "Holdout is a chronological split; repeated tuning on it "
+               "removes its independence.")
     label = {1: "BUY", -1: "SELL", 0: "WAIT"}
-    st.write("Latest synthetic signal:", label[int(d.signal.iloc[-1])])
+    st.write("Last dataset candle signal (historical, not live):",
+             label[int(d.signal.iloc[-1])])
     st.info(
-        "No real historical validation. Daily loss exits use "
-        "executable candle quotes and include commission. "
-        "Gaps can exceed the daily budget; reaching it blocks "
-        "further entries that day. Constant costs and stop-first "
-        "ambiguous candles are modeling assumptions."
+        "Daily loss exits include commission. Gaps can exceed the daily "
+        "budget; reaching it blocks further entries that day. "
+        "Constant costs and stop-first ambiguous candles are modeling "
+        "assumptions. Results do not guarantee future profits."
     )
 else:
-    st.info("Tap Run V43 Demo Backtest. No downloads needed.")
+    st.info("Upload your M1 CSV and tap Run Backtest, or select Synthetic demo.")
 
 # END OF APP
